@@ -6,7 +6,7 @@ This project lets you receive iOS and iPadOS notifications on your Linux desktop
 
 It uses Apple Notification Center Service (ANCS) - the same protocol that smartwatches use. Bluetooth 4.0 (Low Energy) is required.
 
-**NOTE: I am no longer using this project. However, it should still work. PRs are welcome.**
+**NOTE: I am no longer using this project. However, it should still work. PRs are welcome. Check out https://github.com/zackb/tether**
 
 ## Running
 
