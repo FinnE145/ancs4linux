@@ -17,6 +17,28 @@ class ShowNotificationData:
     body: str
     positive_action: Optional[str]
     negative_action: Optional[str]
+    # Added on fe-pro: everything else ANCS reports, passed on as-is (no filtering or
+    # interpretation -- that's the consumer's job). None = not known. Defaults keep JSON
+    # from older senders parseable.
+    #   event         "added" / "modified" (ANCS EventID)
+    #   pre_existing  iOS's EventFlagPreExisting: it was already in Notification Center when
+    #                 this connection started (not the same as "old"). iOS renumbers
+    #                 notifications per connection, so ids only mean something within one.
+    #   silent, important     iOS's EventFlagSilent / EventFlagImportant
+    #   category, category_count  ANCS CategoryID name (raw number if unknown) and how
+    #                 many notifications iOS holds in that category
+    #   subtitle      e.g. the subject for Mail, where title is the sender
+    #   date          as sent: "yyyyMMdd'T'HHmmSS", the phone's local time, no time zone
+    #   message_size  as sent: decimal string, length of the full message (body may be cut)
+    event: Optional[str] = None
+    pre_existing: Optional[bool] = None
+    silent: Optional[bool] = None
+    important: Optional[bool] = None
+    category: Optional[str] = None
+    category_count: Optional[int] = None
+    subtitle: str = ""
+    date: str = ""
+    message_size: str = ""
 
     def json(self) -> str:
         return json.dumps(vars(self))

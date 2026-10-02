@@ -21,17 +21,27 @@ class Notification:
     id: int
     type: EventID
     flags: EventFlag
+    category: int = 0
+    category_count: int = 0
 
     @classmethod
     def parse(cls, data: bytes) -> "Notification":
-        [type, flags, _, _, id] = struct.unpack("<BBBBI", bytearray(data))
-        return cls(id=id, type=type, flags=flags)
+        [type, flags, category, count, id] = struct.unpack("<BBBBI", bytearray(data))
+        return cls(
+            id=id, type=type, flags=flags, category=category, category_count=count
+        )
 
     def is_preexisting(self) -> bool:
         return self.flags & EventFlag.PreExisting > 0
 
     def is_fresh(self) -> bool:
         return not self.is_preexisting()
+
+    def is_silent(self) -> bool:
+        return self.flags & EventFlag.Silent > 0
+
+    def is_important(self) -> bool:
+        return self.flags & EventFlag.Important > 0
 
     def has_positive_action(self) -> bool:
         return self.flags & EventFlag.PositiveAction > 0
@@ -68,26 +78,29 @@ class NotificationAttributes:
     message: str
     positive_action: Optional[str]
     negative_action: Optional[str]
+    subtitle: str = ""
+    date: str = ""
+    message_size: str = ""
 
     @classmethod
     def parse(cls, data: bytes) -> "NotificationAttributes":
         msg = bytearray(data)
         id, msg = struct.unpack("<I", msg[:4])[0], msg[4:]
-        app_id, msg = parse_string(msg)
-        title, msg = parse_string(msg)
-        message, msg = parse_string(msg)
-        positive_action = negative_action = None
-        if len(msg) > 0 and msg[0] == NotificationAttributeID.PositiveActionLabel:
-            positive_action, msg = parse_string(msg)
-        if len(msg) > 0 and msg[0] == NotificationAttributeID.NegativeActionLabel:
-            negative_action, msg = parse_string(msg)
+        # Read attributes by their ID rather than assuming the order they come in.
+        attrs = {}
+        while len(msg) >= 3:
+            attr_id = msg[0]
+            attrs[attr_id], msg = parse_string(msg)
         return cls(
             id=id,
-            app_id=app_id,
-            title=title,
-            message=message,
-            positive_action=positive_action,
-            negative_action=negative_action,
+            app_id=attrs.get(NotificationAttributeID.AppIdentifier, ""),
+            title=attrs.get(NotificationAttributeID.Title, ""),
+            subtitle=attrs.get(NotificationAttributeID.Subtitle, ""),
+            message=attrs.get(NotificationAttributeID.Message, ""),
+            date=attrs.get(NotificationAttributeID.Date, ""),
+            message_size=attrs.get(NotificationAttributeID.MessageSize, ""),
+            positive_action=attrs.get(NotificationAttributeID.PositiveActionLabel),
+            negative_action=attrs.get(NotificationAttributeID.NegativeActionLabel),
         )
 
 
@@ -102,7 +115,7 @@ class AppAttributes:
         app_id_bytes, msg = msg.split(b"\0", 1)
         app_id = app_id_bytes.decode("utf8", errors="replace")
         if len(msg) == 0:
-            app_name = "<not installed>"
+            app_name = ""
         else:
             app_name_size, msg = struct.unpack("<BH", msg[:3])[1], msg[3:]
             app_name_bytes, msg = msg[:app_name_size], msg[app_name_size:]

@@ -19,14 +19,18 @@ class GetNotificationAttributes:
 
     def to_list(self) -> List[int]:
         msg = struct.pack(
-            "<BIBBHBH",
+            "<BIBBHBHBHBB",
             CommandID.GetNotificationAttributes,
             self.id,
             NotificationAttributeID.AppIdentifier,
             NotificationAttributeID.Title,
             USHORT_MAX,
+            NotificationAttributeID.Subtitle,
+            USHORT_MAX,
             NotificationAttributeID.Message,
             USHORT_MAX,
+            NotificationAttributeID.MessageSize,
+            NotificationAttributeID.Date,
         )
         if self.get_positive_action:
             msg += struct.pack("<B", NotificationAttributeID.PositiveActionLabel)

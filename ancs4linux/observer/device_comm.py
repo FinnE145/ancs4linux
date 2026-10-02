@@ -1,5 +1,5 @@
 import random
-from typing import TYPE_CHECKING, Dict, List, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
 from ancs4linux.common.apis import ShowNotificationData
 from ancs4linux.common.dbus import Variant
@@ -8,13 +8,29 @@ from ancs4linux.observer.ancs.builders import (
     GetNotificationAttributes,
     PerformNotificationAction,
 )
-from ancs4linux.observer.ancs.constants import UINT_MAX, CommandID, EventID
+from ancs4linux.observer.ancs.constants import (
+    UINT_MAX,
+    CategoryID,
+    CommandID,
+    EventID,
+)
 from ancs4linux.observer.ancs.parsers import (
     AppAttributes,
     DataSourceEvent,
     Notification,
     NotificationAttributes,
 )
+
+CATEGORY_NAMES = {
+    value: name
+    for name, value in vars(CategoryID).items()
+    if not name.startswith("_") and isinstance(value, int)
+}
+
+EVENT_NAMES = {
+    EventID.NotificationAdded: "added",
+    EventID.NotificationModified: "modified",
+}
 
 if TYPE_CHECKING:
     from ancs4linux.observer.device import MobileDevice
@@ -27,6 +43,8 @@ class DeviceCommunicator:
         self.notification_queue: List[ShowNotificationData] = []
         self.awaiting_app_names: Set[str] = set()
         self.known_app_names: Dict[str, str] = dict()
+        # Notification Source events awaiting their attributes, by iOS notification UID.
+        self.pending_events: Dict[int, Notification] = dict()
 
     def attach(self) -> None:
         assert self.device.notification_source and self.device.data_source
@@ -50,12 +68,33 @@ class DeviceCommunicator:
             return
 
         notification = Notification.parse(changes["Value"].unpack())
-        if notification.type == EventID.NotificationAdded and notification.is_fresh():
-            self.ask_for_notification_details(notification)
-        elif notification.type == EventID.NotificationModified:
+        if notification.type in (
+            EventID.NotificationAdded,
+            EventID.NotificationModified,
+        ):
+            # Upstream turned pre-existing additions into dismissals; fetch them all and
+            # pass the flag on instead, so consumers decide what "old" means.
+            self.pending_events[notification.id] = notification
             self.ask_for_notification_details(notification)
         else:
-            self.device.server.emit_dismiss_notification(notification.id)
+            self.pending_events.pop(notification.id, None)
+            self.device.server.emit_dismiss_notification(self.host_id(notification.id))
+
+    def host_id(self, uid: int) -> int:
+        return (self.id + uid) % UINT_MAX
+
+    @staticmethod
+    def event_fields(event: Optional[Notification]) -> Dict[str, Any]:
+        if event is None:  # attributes arrived without a matching event: unknown
+            return {}
+        return {
+            "event": EVENT_NAMES.get(event.type, str(event.type)),
+            "pre_existing": event.is_preexisting(),
+            "silent": event.is_silent(),
+            "important": event.is_important(),
+            "category": CATEGORY_NAMES.get(event.category, str(event.category)),
+            "category_count": event.category_count,
+        }
 
     def ask_for_notification_details(self, notification: Notification) -> None:
         msg = GetNotificationAttributes(
@@ -80,17 +119,22 @@ class DeviceCommunicator:
 
     def on_notification_attributes(self, attrs: NotificationAttributes) -> None:
         assert self.device.name
+        event = self.pending_events.pop(attrs.id, None)
         self.queue_notification(
             ShowNotificationData(
                 device_handle=self.device.path,
                 device_name=self.device.name,
                 app_id=attrs.app_id,
                 app_name="",
-                id=(self.id + attrs.id) % UINT_MAX,
+                id=self.host_id(attrs.id),
                 title=attrs.title,
                 body=attrs.message,
                 positive_action=attrs.positive_action,
                 negative_action=attrs.negative_action,
+                subtitle=attrs.subtitle,
+                date=attrs.date,
+                message_size=attrs.message_size,
+                **self.event_fields(event),
             )
         )
         self.process_queue()
