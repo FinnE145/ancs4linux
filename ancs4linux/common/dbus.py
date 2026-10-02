@@ -57,6 +57,11 @@ class PairingRejected(DBusError):
     pass
 
 
+@dbus_error("ancs4linux.Error.InvalidAction")
+class InvalidAction(DBusError):
+    """InvokeDeviceAction was asked for something that can't be done on this connection."""
+
+
 class MessageBus(ABC):
     @abstractmethod
     def publish_object(self, address: ObjPath, object: Any) -> None:

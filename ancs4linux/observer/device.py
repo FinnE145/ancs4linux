@@ -2,7 +2,7 @@ import logging
 from typing import Optional
 
 from ancs4linux.common.apis import ObserverAPI
-from ancs4linux.common.dbus import ObjPath, get_dbus_error_name
+from ancs4linux.common.dbus import InvalidAction, ObjPath, get_dbus_error_name
 from ancs4linux.common.external_apis import BluezGattCharacteristicAPI
 from ancs4linux.common.task_restarter import TaskRestarter
 from ancs4linux.observer.device_comm import DeviceCommunicator
@@ -112,5 +112,6 @@ class MobileDevice:
         return True
 
     def handle_action(self, notification_id: int, is_positive: bool) -> None:
-        if self.communicator is not None:
-            self.communicator.ask_for_action(notification_id, is_positive)
+        if self.communicator is None:
+            raise InvalidAction("Phone is not connected/subscribed")
+        self.communicator.ask_for_action(notification_id, is_positive)
