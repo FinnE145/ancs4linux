@@ -1,5 +1,6 @@
 import logging
-from typing import Optional
+import random
+from typing import Dict, Optional, Tuple
 
 from ancs4linux.common.apis import ObserverAPI
 from ancs4linux.common.dbus import InvalidAction, ObjPath, get_dbus_error_name
@@ -18,6 +19,14 @@ class MobileDevice:
         # Bumped by every subscribe attempt; an attempt that finds it has been superseded
         # stops without attaching, so only the newest one ends up subscribed.
         self.generation = 0
+        # Ids are id_base + iOS notification UID. iOS keeps UIDs across reconnects, so the
+        # base lives as long as the device (upstream picked a new one per connection,
+        # which gave the same notification a different id after every reconnect).
+        self.id_base = random.randint(1, 10**5) * 1000
+        # Ids that still exist on the phone, with the actions iOS offers for each:
+        # {id: (positive, negative)}. Reset on each fresh subscription and rebuilt from
+        # the full list iOS then sends.
+        self.actionable: Dict[int, Tuple[bool, bool]] = dict()
 
         self.paired = False
         self.connected = False
@@ -97,6 +106,12 @@ class MobileDevice:
             # Timeouts (timeout=1000 [ms]) do not work.
             self.data_source.StartNotify()
             self.notification_source.StartNotify()
+            # iOS only sends its full Notification Center list when the subscription is
+            # switched on. After a reconnect BlueZ can restore the old subscription, and
+            # then iOS sends nothing: notifications that arrived or were cleared during
+            # the gap would be missed. Switching it off and on forces the full list.
+            self.notification_source.StopNotify()
+            self.notification_source.StartNotify()
         except Exception as e:
             log.warn(
                 f"Failed to start subscribe to notifications (is phone paired?): {e}"
@@ -108,6 +123,8 @@ class MobileDevice:
         comm = DeviceCommunicator(self)
         comm.attach()
         self.communicator = comm
+        self.actionable.clear()
+        self.server.emit_subscribed(self.path)
 
         return True
 

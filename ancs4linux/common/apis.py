@@ -75,6 +75,14 @@ class ObserverAPI(ABC):
 
     DismissNotification: Signal
 
+    # Added on fe-pro: emitted when a fresh ANCS subscription starts on a connection.
+    # iOS then re-sends everything in Notification Center, so what follows is the
+    # phone's complete current list; anything not in it is gone.
+    def emit_subscribed(self, device_handle: str) -> None:
+        self.Subscribed(device_handle)
+
+    Subscribed: Signal
+
 
 class AdvertisingAPI(ABC):
     interface = "ancs4linux.Advertising"

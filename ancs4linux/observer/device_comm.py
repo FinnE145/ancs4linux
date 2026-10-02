@@ -1,4 +1,3 @@
-import random
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 from ancs4linux.common.apis import ShowNotificationData
@@ -40,15 +39,11 @@ if TYPE_CHECKING:
 class DeviceCommunicator:
     def __init__(self, device: "MobileDevice"):
         self.device = device
-        self.id = random.randint(1, 10**5) * 1000
         self.notification_queue: List[ShowNotificationData] = []
         self.awaiting_app_names: Set[str] = set()
         self.known_app_names: Dict[str, str] = dict()
         # Notification Source events awaiting their attributes, by iOS notification UID.
         self.pending_events: Dict[int, Notification] = dict()
-        # Ids handed out on this connection that still exist on the phone, with the
-        # actions iOS offers for each: {id: (positive, negative)}.
-        self.actionable: Dict[int, Tuple[bool, bool]] = dict()
 
     def attach(self) -> None:
         assert self.device.notification_source and self.device.data_source
@@ -82,11 +77,11 @@ class DeviceCommunicator:
             self.ask_for_notification_details(notification)
         else:
             self.pending_events.pop(notification.id, None)
-            self.actionable.pop(self.host_id(notification.id), None)
+            self.device.actionable.pop(self.host_id(notification.id), None)
             self.device.server.emit_dismiss_notification(self.host_id(notification.id))
 
     def host_id(self, uid: int) -> int:
-        return (self.id + uid) % UINT_MAX
+        return (self.device.id_base + uid) % UINT_MAX
 
     @staticmethod
     def event_fields(event: Optional[Notification]) -> Dict[str, Any]:
@@ -125,7 +120,7 @@ class DeviceCommunicator:
     def on_notification_attributes(self, attrs: NotificationAttributes) -> None:
         assert self.device.name
         event = self.pending_events.pop(attrs.id, None)
-        self.actionable[self.host_id(attrs.id)] = (
+        self.device.actionable[self.host_id(attrs.id)] = (
             attrs.positive_action is not None,
             attrs.negative_action is not None,
         )
@@ -179,21 +174,19 @@ class DeviceCommunicator:
         self.notification_queue = unprocessed
 
     def ask_for_action(self, notification_id: int, is_positive: bool) -> None:
-        # iOS renumbers notifications on every connection, so an id from an earlier
-        # connection (or one already removed) could map onto a different notification
-        # here -- e.g. the Accept of the wrong call. Refuse anything not issued on this
-        # connection, or an action iOS didn't offer for it.
-        if notification_id not in self.actionable:
-            raise InvalidAction(
-                f"Notification {notification_id} isn't on the phone in this connection"
-            )
-        positive, negative = self.actionable[notification_id]
+        # Only act on ids iOS has listed since the last fresh subscription and not
+        # removed since, and only with an action iOS offered. Anything else could be a
+        # notification that's gone -- or, after a phone reboot resets UIDs, a different
+        # one (e.g. the Accept of the wrong call).
+        if notification_id not in self.device.actionable:
+            raise InvalidAction(f"Notification {notification_id} isn't on the phone")
+        positive, negative = self.device.actionable[notification_id]
         if not (positive if is_positive else negative):
             raise InvalidAction(
                 f"Notification {notification_id} has no "
                 f"{'positive' if is_positive else 'negative'} action"
             )
-        id = (notification_id - self.id) % UINT_MAX
+        id = (notification_id - self.device.id_base) % UINT_MAX
         msg = PerformNotificationAction(notification_id=id, is_positive=is_positive)
         assert self.device.control_point
         self.device.control_point.WriteValue(msg.to_list(), {})

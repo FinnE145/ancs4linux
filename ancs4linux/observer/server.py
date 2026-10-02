@@ -31,3 +31,7 @@ class ObserverServer(ObserverAPI):
     @dbus_signal
     def DismissNotification(self, id: UInt32) -> None:
         pass
+
+    @dbus_signal
+    def Subscribed(self, device_handle: Str) -> None:
+        pass
