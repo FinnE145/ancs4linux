@@ -76,6 +76,11 @@ class Scanner:
             return
 
     def remove_observers(self, path: ObjPath, services: List[Str]) -> None:
+        # Only forget the device when Device1 itself goes away. Other interfaces on the
+        # device path (e.g. Battery1) disappear on every disconnect, and dropping the
+        # watcher then means a reconnect is never noticed.
+        if BluezDeviceAPI.interface not in services:
+            return
         if path in self.property_observers:
             self.property_observers[path].PropertiesChanged.disconnect()
             del self.property_observers[path]
