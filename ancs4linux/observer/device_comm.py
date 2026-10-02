@@ -30,10 +30,18 @@ class DeviceCommunicator:
 
     def attach(self) -> None:
         assert self.device.notification_source and self.device.data_source
-        self.device.notification_source.PropertiesChanged.disconnect()
-        self.device.notification_source.PropertiesChanged.connect(self.on_ns_change)
-        self.device.data_source.PropertiesChanged.disconnect()
-        self.device.data_source.PropertiesChanged.connect(self.on_ds_change)
+        # Keep the proxies we attached to: the device may swap in new ones on reconnect,
+        # and detach() must remove our handlers from these, not from the new ones.
+        self.notification_source = self.device.notification_source
+        self.data_source = self.device.data_source
+        self.notification_source.PropertiesChanged.disconnect()
+        self.notification_source.PropertiesChanged.connect(self.on_ns_change)
+        self.data_source.PropertiesChanged.disconnect()
+        self.data_source.PropertiesChanged.connect(self.on_ds_change)
+
+    def detach(self) -> None:
+        self.notification_source.PropertiesChanged.disconnect(self.on_ns_change)
+        self.data_source.PropertiesChanged.disconnect(self.on_ds_change)
 
     def on_ns_change(
         self, interface: str, changes: Dict[str, Variant], invalidated: List[str]

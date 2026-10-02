@@ -15,6 +15,9 @@ class MobileDevice:
         self.server = server
         self.path = path
         self.communicator: Optional[DeviceCommunicator] = None
+        # Bumped by every subscribe attempt; an attempt that finds it has been superseded
+        # stops without attaching, so only the newest one ends up subscribed.
+        self.generation = 0
 
         self.paired = False
         self.connected = False
@@ -54,6 +57,8 @@ class MobileDevice:
         self.try_subscribe()
 
     def unsubscribe(self) -> None:
+        if self.communicator is not None:
+            self.communicator.detach()
         self.communicator = None
 
     def try_subscribe(self) -> None:
@@ -71,16 +76,21 @@ class MobileDevice:
         ):
             return
 
-        log.info("Asking for notifications...")
+        self.generation += 1
+        generation = self.generation
+        log.info(f"Asking for notifications (attempt {generation})...")
         TaskRestarter(
             120,
             1,
-            self.try_asking,
+            lambda: self.try_asking(generation),
             lambda: log.info("Asking for notifications: success."),
             lambda: log.error("Failed to subscribe to notifications."),
         ).try_running_bg()
 
-    def try_asking(self) -> bool:
+    def try_asking(self, generation: int) -> bool:
+        if generation != self.generation or self.communicator is not None:
+            log.debug(f"Subscribe attempt {generation} superseded.")
+            return True
         assert self.notification_source and self.control_point and self.data_source
         try:
             # FIXME: blocking here (e.g. due to device not responding) can lock our program.
