@@ -1,0 +1,23 @@
+# Keeps fe-pro reachable for the bonded iPhone over LE and keeps pairing closed: runs
+# ancs-advertiser.py (see its docstring), after (re)registering ancs4linux's pairing agent.
+# Pairing itself is opened by hand with ancs-pair.
+#
+# Needs BlueZ >= 5.87 (installed 2026-10-06 as a local rebuild, see SERVER.md): on kernel
+# 6.8.0-142 older bluetoothd couldn't register any advertisement, which is why this unit
+# used to drive the kernel directly with btmgmt.
+[Unit]
+Description=Keep fe-pro advertising to the bonded iPhone over LE, pairing closed (ancs4linux)
+BindsTo=ancs4linux-advertising.service
+After=ancs4linux-advertising.service bluetooth.service
+
+[Service]
+Type=simple
+ExecStartPre=/opt/ancs4linux/venv/bin/ancs4linux-ctl enable-pairing
+ExecStart=/opt/ancs4linux/venv/bin/python3 /opt/ancs4linux/bin/ancs-advertiser.py
+Restart=always
+RestartSec=5
+WatchdogSec=60
+NotifyAccess=main
+
+[Install]
+WantedBy=ancs4linux-advertising.service

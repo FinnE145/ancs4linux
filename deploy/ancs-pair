@@ -1,0 +1,38 @@
+#!/bin/bash
+# Open a pairing window on fe-pro for the iPhone, and close it again afterwards.
+# Usage: sudo ancs-pair [seconds]   (default 180)
+# While open, ancs4linux's agent accepts any pairing request, so keep the window short.
+# Pairing happens over classic Bluetooth (that's how iOS Settings finds fe-pro); afterwards
+# classic is switched off again and the phone reconnects over LE by itself.
+set -u
+window=${1:-180}
+[ "$EUID" -eq 0 ] || { echo "Run with sudo." >&2; exit 1; }
+adapter() { busctl set-property org.bluez /org/bluez/hci0 org.bluez.Adapter1 "$1" b "$2"; }
+
+close() {
+    rm -f /run/ancs4linux-pairing
+    adapter Pairable false
+    adapter Discoverable false
+    adapter Connectable false
+    echo "Pairing window closed."
+}
+
+systemctl is-active --quiet ancs4linux-advertise || {
+    echo "ancs4linux-advertise isn't running; the phone won't be able to connect." >&2
+    exit 1
+}
+trap close EXIT
+# Tell ancs-advertiser to leave the adapter open until the window ends (it closes anything
+# opened outside a window). Written first, so it's in place before anything turns on.
+echo $(( $(date +%s) + window )) > /run/ancs4linux-pairing
+adapter Connectable true
+bluetoothctl discoverable-timeout "$window" >/dev/null
+bluetoothctl pairable on >/dev/null
+bluetoothctl discoverable on >/dev/null
+
+echo "fe-pro is pairable for ${window}s."
+echo "If re-pairing: first forget fe-pro on the iPhone, and run: bluetoothctl remove <phone MAC>"
+echo "On the iPhone: Settings -> Bluetooth -> fe-pro, check the code, Pair, then allow notifications."
+echo "The code also appears in /var/log/ancs4linux/notifications.log (event pairing_code)."
+echo "Press Enter once paired. The phone may show 'not connected' briefly, then reconnects over LE."
+read -r -t "$window" || true

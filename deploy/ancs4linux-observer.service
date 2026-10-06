@@ -1,0 +1,19 @@
+# fe-pro version of upstream autorun/ancs4linux-observer.service: venv path, restart policy.
+[Unit]
+Description=ancs4linux Observer daemon (reads iPhone notifications over ANCS)
+Requires=bluetooth.service
+After=bluetooth.service
+
+[Service]
+Type=dbus
+BusName=ancs4linux.Observer
+ExecStart=/opt/ancs4linux/venv/bin/ancs4linux-observer
+Restart=always
+RestartSec=5
+# The observer pings the watchdog from its main loop (patch 0006); if the loop ever
+# blocks again, systemd restarts it instead of it hanging silently.
+WatchdogSec=60
+NotifyAccess=main
+
+[Install]
+WantedBy=multi-user.target

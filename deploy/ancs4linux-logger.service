@@ -1,0 +1,20 @@
+# Debug consumer of ancs4linux's D-Bus signals; stand-in for the future MQTT bridge.
+[Unit]
+Description=ancs4linux debug logger (notifications -> /var/log/ancs4linux)
+After=ancs4linux-observer.service ancs4linux-advertising.service
+
+[Service]
+Type=simple
+User=finne
+Group=finne
+SupplementaryGroups=ancs4linux
+EnvironmentFile=/etc/ancs4linux.env
+ExecStart=/opt/ancs4linux/venv/bin/python3 /opt/ancs4linux/bin/ancs-logger.py
+LogsDirectory=ancs4linux
+LogsDirectoryMode=0700
+UMask=0077
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

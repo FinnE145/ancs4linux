@@ -1,0 +1,157 @@
+From fdebb718e69b90604dd55958fb7eeee91371954e Mon Sep 17 00:00:00 2001
+From: FinnE145 <finne014@gmail.com>
+Date: Fri, 2 Oct 2026 01:46:20 +0000
+Subject: [PATCH] observer: refuse actions on ids not valid for this connection
+
+iOS renumbers notifications on every connection, so an id issued before
+a reconnect could map onto a different notification (e.g. the Accept of
+the wrong call). InvokeDeviceAction now refuses ids not issued on the
+current connection, ids already removed, and actions iOS didn't offer,
+and reports unknown devices / no connection instead of ignoring them
+silently. Errors are ancs4linux.Error.InvalidAction.
+
+---
+ ancs4linux/common/dbus.py          |  5 +++++
+ ancs4linux/observer/device.py      |  7 ++++---
+ ancs4linux/observer/device_comm.py | 25 ++++++++++++++++++++++++-
+ ancs4linux/observer/server.py      | 17 ++++++++++++-----
+ 4 files changed, 45 insertions(+), 9 deletions(-)
+
+diff --git a/ancs4linux/common/dbus.py b/ancs4linux/common/dbus.py
+index fc463d3..2d1f708 100644
+--- a/ancs4linux/common/dbus.py
++++ b/ancs4linux/common/dbus.py
+@@ -57,6 +57,11 @@ class PairingRejected(DBusError):
+     pass
+ 
+ 
++@dbus_error("ancs4linux.Error.InvalidAction")
++class InvalidAction(DBusError):
++    """InvokeDeviceAction was asked for something that can't be done on this connection."""
++
++
+ class MessageBus(ABC):
+     @abstractmethod
+     def publish_object(self, address: ObjPath, object: Any) -> None:
+diff --git a/ancs4linux/observer/device.py b/ancs4linux/observer/device.py
+index 9e6c956..fe8614c 100644
+--- a/ancs4linux/observer/device.py
++++ b/ancs4linux/observer/device.py
+@@ -2,7 +2,7 @@ import logging
+ from typing import Optional
+ 
+ from ancs4linux.common.apis import ObserverAPI
+-from ancs4linux.common.dbus import ObjPath, get_dbus_error_name
++from ancs4linux.common.dbus import InvalidAction, ObjPath, get_dbus_error_name
+ from ancs4linux.common.external_apis import BluezGattCharacteristicAPI
+ from ancs4linux.common.task_restarter import TaskRestarter
+ from ancs4linux.observer.device_comm import DeviceCommunicator
+@@ -112,5 +112,6 @@ class MobileDevice:
+         return True
+ 
+     def handle_action(self, notification_id: int, is_positive: bool) -> None:
+-        if self.communicator is not None:
+-            self.communicator.ask_for_action(notification_id, is_positive)
++        if self.communicator is None:
++            raise InvalidAction("Phone is not connected/subscribed")
++        self.communicator.ask_for_action(notification_id, is_positive)
+diff --git a/ancs4linux/observer/device_comm.py b/ancs4linux/observer/device_comm.py
+index ca8e6bc..33a2f0e 100644
+--- a/ancs4linux/observer/device_comm.py
++++ b/ancs4linux/observer/device_comm.py
+@@ -1,7 +1,8 @@
+ import random
+-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
++from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
+ 
+ from ancs4linux.common.apis import ShowNotificationData
++from ancs4linux.common.dbus import InvalidAction
+ from ancs4linux.common.dbus import Variant
+ from ancs4linux.observer.ancs.builders import (
+     GetAppAttributes,
+@@ -45,6 +46,9 @@ class DeviceCommunicator:
+         self.known_app_names: Dict[str, str] = dict()
+         # Notification Source events awaiting their attributes, by iOS notification UID.
+         self.pending_events: Dict[int, Notification] = dict()
++        # Ids handed out on this connection that still exist on the phone, with the
++        # actions iOS offers for each: {id: (positive, negative)}.
++        self.actionable: Dict[int, Tuple[bool, bool]] = dict()
+ 
+     def attach(self) -> None:
+         assert self.device.notification_source and self.device.data_source
+@@ -78,6 +82,7 @@ class DeviceCommunicator:
+             self.ask_for_notification_details(notification)
+         else:
+             self.pending_events.pop(notification.id, None)
++            self.actionable.pop(self.host_id(notification.id), None)
+             self.device.server.emit_dismiss_notification(self.host_id(notification.id))
+ 
+     def host_id(self, uid: int) -> int:
+@@ -120,6 +125,10 @@ class DeviceCommunicator:
+     def on_notification_attributes(self, attrs: NotificationAttributes) -> None:
+         assert self.device.name
+         event = self.pending_events.pop(attrs.id, None)
++        self.actionable[self.host_id(attrs.id)] = (
++            attrs.positive_action is not None,
++            attrs.negative_action is not None,
++        )
+         self.queue_notification(
+             ShowNotificationData(
+                 device_handle=self.device.path,
+@@ -170,6 +179,20 @@ class DeviceCommunicator:
+         self.notification_queue = unprocessed
+ 
+     def ask_for_action(self, notification_id: int, is_positive: bool) -> None:
++        # iOS renumbers notifications on every connection, so an id from an earlier
++        # connection (or one already removed) could map onto a different notification
++        # here -- e.g. the Accept of the wrong call. Refuse anything not issued on this
++        # connection, or an action iOS didn't offer for it.
++        if notification_id not in self.actionable:
++            raise InvalidAction(
++                f"Notification {notification_id} isn't on the phone in this connection"
++            )
++        positive, negative = self.actionable[notification_id]
++        if not (positive if is_positive else negative):
++            raise InvalidAction(
++                f"Notification {notification_id} has no "
++                f"{'positive' if is_positive else 'negative'} action"
++            )
+         id = (notification_id - self.id) % UINT_MAX
+         msg = PerformNotificationAction(notification_id=id, is_positive=is_positive)
+         assert self.device.control_point
+diff --git a/ancs4linux/observer/server.py b/ancs4linux/observer/server.py
+index e5388dd..415b481 100644
+--- a/ancs4linux/observer/server.py
++++ b/ancs4linux/observer/server.py
+@@ -1,5 +1,12 @@
+ from ancs4linux.common.apis import ObserverAPI
+-from ancs4linux.common.dbus import Bool, Str, UInt32, dbus_interface, dbus_signal
++from ancs4linux.common.dbus import (
++    Bool,
++    InvalidAction,
++    Str,
++    UInt32,
++    dbus_interface,
++    dbus_signal,
++)
+ from ancs4linux.observer.scanner import Scanner
+ 
+ 
+@@ -11,10 +18,10 @@ class ObserverServer(ObserverAPI):
+     def InvokeDeviceAction(
+         self, device_handle: Str, notification_id: UInt32, is_positive: Bool
+     ) -> None:
+-        if self.scanner is None:
+-            return
+-        if device_handle not in self.scanner.devices:
+-            return
++        # Upstream ignored bad requests silently; report them so the caller knows the
++        # action did not happen.
++        if self.scanner is None or device_handle not in self.scanner.devices:
++            raise InvalidAction(f"Unknown device {device_handle}")
+         self.scanner.devices[device_handle].handle_action(notification_id, is_positive)
+ 
+     @dbus_signal
+-- 
+2.43.0
+

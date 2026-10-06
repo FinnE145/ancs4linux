@@ -1,0 +1,188 @@
+From da1b274ee7626f6be1d99b96c4b7a8fb92502087 Mon Sep 17 00:00:00 2001
+From: FinnE145 <finne014@gmail.com>
+Date: Fri, 2 Oct 2026 02:01:52 +0000
+Subject: [PATCH] observer: stable ids and a full list on every connection
+
+Tested on an iPhone: iOS keeps notification UIDs across reconnects, but
+after a reconnect BlueZ can restore the existing ANCS subscription, and
+iOS then sends nothing -- notifications that arrived or were cleared
+while disconnected were never reported. Meanwhile upstream picked a new
+id base per connection, so the same notification got a different id
+after every reconnect.
+
+- Keep the id base per device, so ids are stable across reconnects.
+- Switch the Notification Source subscription off and on after
+  subscribing, which makes iOS re-send its full Notification Center.
+- Emit a new Subscribed(device_handle) signal when that happens: what
+  follows is the phone's complete current list.
+- Keep the action guard per device, reset on each fresh subscription and
+  rebuilt from the list, instead of per connection.
+
+---
+ ancs4linux/common/apis.py          |  8 ++++++++
+ ancs4linux/observer/device.py      | 19 ++++++++++++++++++-
+ ancs4linux/observer/device_comm.py | 29 +++++++++++------------------
+ ancs4linux/observer/server.py      |  4 ++++
+ 4 files changed, 41 insertions(+), 19 deletions(-)
+
+diff --git a/ancs4linux/common/apis.py b/ancs4linux/common/apis.py
+index 3ccdc43..d6f5c7f 100644
+--- a/ancs4linux/common/apis.py
++++ b/ancs4linux/common/apis.py
+@@ -75,6 +75,14 @@ class ObserverAPI(ABC):
+ 
+     DismissNotification: Signal
+ 
++    # Added on fe-pro: emitted when a fresh ANCS subscription starts on a connection.
++    # iOS then re-sends everything in Notification Center, so what follows is the
++    # phone's complete current list; anything not in it is gone.
++    def emit_subscribed(self, device_handle: str) -> None:
++        self.Subscribed(device_handle)
++
++    Subscribed: Signal
++
+ 
+ class AdvertisingAPI(ABC):
+     interface = "ancs4linux.Advertising"
+diff --git a/ancs4linux/observer/device.py b/ancs4linux/observer/device.py
+index fe8614c..648100c 100644
+--- a/ancs4linux/observer/device.py
++++ b/ancs4linux/observer/device.py
+@@ -1,5 +1,6 @@
+ import logging
+-from typing import Optional
++import random
++from typing import Dict, Optional, Tuple
+ 
+ from ancs4linux.common.apis import ObserverAPI
+ from ancs4linux.common.dbus import InvalidAction, ObjPath, get_dbus_error_name
+@@ -18,6 +19,14 @@ class MobileDevice:
+         # Bumped by every subscribe attempt; an attempt that finds it has been superseded
+         # stops without attaching, so only the newest one ends up subscribed.
+         self.generation = 0
++        # Ids are id_base + iOS notification UID. iOS keeps UIDs across reconnects, so the
++        # base lives as long as the device (upstream picked a new one per connection,
++        # which gave the same notification a different id after every reconnect).
++        self.id_base = random.randint(1, 10**5) * 1000
++        # Ids that still exist on the phone, with the actions iOS offers for each:
++        # {id: (positive, negative)}. Reset on each fresh subscription and rebuilt from
++        # the full list iOS then sends.
++        self.actionable: Dict[int, Tuple[bool, bool]] = dict()
+ 
+         self.paired = False
+         self.connected = False
+@@ -97,6 +106,12 @@ class MobileDevice:
+             # Timeouts (timeout=1000 [ms]) do not work.
+             self.data_source.StartNotify()
+             self.notification_source.StartNotify()
++            # iOS only sends its full Notification Center list when the subscription is
++            # switched on. After a reconnect BlueZ can restore the old subscription, and
++            # then iOS sends nothing: notifications that arrived or were cleared during
++            # the gap would be missed. Switching it off and on forces the full list.
++            self.notification_source.StopNotify()
++            self.notification_source.StartNotify()
+         except Exception as e:
+             log.warn(
+                 f"Failed to start subscribe to notifications (is phone paired?): {e}"
+@@ -108,6 +123,8 @@ class MobileDevice:
+         comm = DeviceCommunicator(self)
+         comm.attach()
+         self.communicator = comm
++        self.actionable.clear()
++        self.server.emit_subscribed(self.path)
+ 
+         return True
+ 
+diff --git a/ancs4linux/observer/device_comm.py b/ancs4linux/observer/device_comm.py
+index 33a2f0e..ba33732 100644
+--- a/ancs4linux/observer/device_comm.py
++++ b/ancs4linux/observer/device_comm.py
+@@ -1,4 +1,3 @@
+-import random
+ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
+ 
+ from ancs4linux.common.apis import ShowNotificationData
+@@ -40,15 +39,11 @@ if TYPE_CHECKING:
+ class DeviceCommunicator:
+     def __init__(self, device: "MobileDevice"):
+         self.device = device
+-        self.id = random.randint(1, 10**5) * 1000
+         self.notification_queue: List[ShowNotificationData] = []
+         self.awaiting_app_names: Set[str] = set()
+         self.known_app_names: Dict[str, str] = dict()
+         # Notification Source events awaiting their attributes, by iOS notification UID.
+         self.pending_events: Dict[int, Notification] = dict()
+-        # Ids handed out on this connection that still exist on the phone, with the
+-        # actions iOS offers for each: {id: (positive, negative)}.
+-        self.actionable: Dict[int, Tuple[bool, bool]] = dict()
+ 
+     def attach(self) -> None:
+         assert self.device.notification_source and self.device.data_source
+@@ -82,11 +77,11 @@ class DeviceCommunicator:
+             self.ask_for_notification_details(notification)
+         else:
+             self.pending_events.pop(notification.id, None)
+-            self.actionable.pop(self.host_id(notification.id), None)
++            self.device.actionable.pop(self.host_id(notification.id), None)
+             self.device.server.emit_dismiss_notification(self.host_id(notification.id))
+ 
+     def host_id(self, uid: int) -> int:
+-        return (self.id + uid) % UINT_MAX
++        return (self.device.id_base + uid) % UINT_MAX
+ 
+     @staticmethod
+     def event_fields(event: Optional[Notification]) -> Dict[str, Any]:
+@@ -125,7 +120,7 @@ class DeviceCommunicator:
+     def on_notification_attributes(self, attrs: NotificationAttributes) -> None:
+         assert self.device.name
+         event = self.pending_events.pop(attrs.id, None)
+-        self.actionable[self.host_id(attrs.id)] = (
++        self.device.actionable[self.host_id(attrs.id)] = (
+             attrs.positive_action is not None,
+             attrs.negative_action is not None,
+         )
+@@ -179,21 +174,19 @@ class DeviceCommunicator:
+         self.notification_queue = unprocessed
+ 
+     def ask_for_action(self, notification_id: int, is_positive: bool) -> None:
+-        # iOS renumbers notifications on every connection, so an id from an earlier
+-        # connection (or one already removed) could map onto a different notification
+-        # here -- e.g. the Accept of the wrong call. Refuse anything not issued on this
+-        # connection, or an action iOS didn't offer for it.
+-        if notification_id not in self.actionable:
+-            raise InvalidAction(
+-                f"Notification {notification_id} isn't on the phone in this connection"
+-            )
+-        positive, negative = self.actionable[notification_id]
++        # Only act on ids iOS has listed since the last fresh subscription and not
++        # removed since, and only with an action iOS offered. Anything else could be a
++        # notification that's gone -- or, after a phone reboot resets UIDs, a different
++        # one (e.g. the Accept of the wrong call).
++        if notification_id not in self.device.actionable:
++            raise InvalidAction(f"Notification {notification_id} isn't on the phone")
++        positive, negative = self.device.actionable[notification_id]
+         if not (positive if is_positive else negative):
+             raise InvalidAction(
+                 f"Notification {notification_id} has no "
+                 f"{'positive' if is_positive else 'negative'} action"
+             )
+-        id = (notification_id - self.id) % UINT_MAX
++        id = (notification_id - self.device.id_base) % UINT_MAX
+         msg = PerformNotificationAction(notification_id=id, is_positive=is_positive)
+         assert self.device.control_point
+         self.device.control_point.WriteValue(msg.to_list(), {})
+diff --git a/ancs4linux/observer/server.py b/ancs4linux/observer/server.py
+index 415b481..ccb049b 100644
+--- a/ancs4linux/observer/server.py
++++ b/ancs4linux/observer/server.py
+@@ -31,3 +31,7 @@ class ObserverServer(ObserverAPI):
+     @dbus_signal
+     def DismissNotification(self, id: UInt32) -> None:
+         pass
++
++    @dbus_signal
++    def Subscribed(self, device_handle: Str) -> None:
++        pass
+-- 
+2.43.0
+

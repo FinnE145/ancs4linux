@@ -1,0 +1,321 @@
+From e249a02f7df94ff83dfc692e08c386e900502a84 Mon Sep 17 00:00:00 2001
+From: FinnE145 <finne014@gmail.com>
+Date: Tue, 6 Oct 2026 16:30:19 +0000
+Subject: [PATCH] observer: never block on bluetoothd; systemd watchdog
+
+dasbus's default D-Bus call timeout is infinite (GLib.MAXINT), and
+upstream made its subscribe calls and control point writes synchronously
+without one. On 2026-10-04 bluetoothd never answered a StartNotify after
+the link dropped, and the observer's main loop froze for two days: the
+phone kept connecting but nothing subscribed, and iOS eventually stopped
+reconnecting at all.
+
+- Subscribing is now a chain of asynchronous calls, each with a 10 s
+  limit, retried every 2 s (up to 60 times) while the attempt is still
+  current and the phone connected.
+- Control point writes for attributes and app names are asynchronous,
+  queued one at a time (bluetoothd rejects a second outstanding write
+  with "In Progress"; a reconnect list means dozens at once),
+  each with a limit; failures are a one-line warning, not a traceback.
+- Actions stay synchronous (so callers see iOS errors) but are limited.
+- main() pings systemd's watchdog from the main loop when WATCHDOG_USEC
+  is set, so a blocked loop gets the observer restarted.
+
+---
+ ancs4linux/observer/device.py      | 106 ++++++++++++++++++++---------
+ ancs4linux/observer/device_comm.py |  54 +++++++++++++--
+ ancs4linux/observer/main.py        |  26 +++++++
+ 3 files changed, 147 insertions(+), 39 deletions(-)
+
+diff --git a/ancs4linux/observer/device.py b/ancs4linux/observer/device.py
+index 648100c..9811341 100644
+--- a/ancs4linux/observer/device.py
++++ b/ancs4linux/observer/device.py
+@@ -1,15 +1,21 @@
+ import logging
+ import random
+-from typing import Dict, Optional, Tuple
++from typing import Any, Callable, Dict, List, Optional, Tuple
++
++from gi.repository import GLib  # type: ignore # dynamic
+ 
+ from ancs4linux.common.apis import ObserverAPI
+-from ancs4linux.common.dbus import InvalidAction, ObjPath, get_dbus_error_name
++from ancs4linux.common.dbus import InvalidAction, ObjPath
+ from ancs4linux.common.external_apis import BluezGattCharacteristicAPI
+-from ancs4linux.common.task_restarter import TaskRestarter
+ from ancs4linux.observer.device_comm import DeviceCommunicator
+ 
+ log = logging.getLogger(__name__)
+ 
++# Every call to bluetoothd gets a limit; dasbus's default is to wait forever.
++CALL_TIMEOUT_MS = 10_000
++SUBSCRIBE_RETRY_SECONDS = 2
++SUBSCRIBE_MAX_ATTEMPTS = 60
++
+ 
+ class MobileDevice:
+     def __init__(self, path: str, server: ObserverAPI):
+@@ -86,48 +92,82 @@ class MobileDevice:
+             return
+ 
+         self.generation += 1
+-        generation = self.generation
+-        log.info(f"Asking for notifications (attempt {generation})...")
+-        TaskRestarter(
+-            120,
+-            1,
+-            lambda: self.try_asking(generation),
+-            lambda: log.info("Asking for notifications: success."),
+-            lambda: log.error("Failed to subscribe to notifications."),
+-        ).try_running_bg()
+-
+-    def try_asking(self, generation: int) -> bool:
+-        if generation != self.generation or self.communicator is not None:
+-            log.debug(f"Subscribe attempt {generation} superseded.")
+-            return True
+-        assert self.notification_source and self.control_point and self.data_source
+-        try:
+-            # FIXME: blocking here (e.g. due to device not responding) can lock our program.
+-            # Timeouts (timeout=1000 [ms]) do not work.
+-            self.data_source.StartNotify()
+-            self.notification_source.StartNotify()
++        self.start_subscribe(self.generation, 1)
++
++    # Subscribing is a chain of asynchronous calls, each with a time limit. Upstream made
++    # them synchronously with dasbus's default timeout, which is infinite: when bluetoothd
++    # never answered one (seen after a link dropped mid-request), the whole observer froze
++    # for days.
++    def subscribe_steps(self) -> List[Tuple[Any, str]]:
++        return [
++            (self.data_source, "StartNotify"),
++            (self.notification_source, "StartNotify"),
+             # iOS only sends its full Notification Center list when the subscription is
+             # switched on. After a reconnect BlueZ can restore the old subscription, and
+             # then iOS sends nothing: notifications that arrived or were cleared during
+             # the gap would be missed. Switching it off and on forces the full list.
+-            self.notification_source.StopNotify()
+-            self.notification_source.StartNotify()
+-        except Exception as e:
+-            log.warn(
+-                f"Failed to start subscribe to notifications (is phone paired?): {e}"
+-            )
+-            if get_dbus_error_name(e) is not None:
+-                log.warn(f"Original error: {get_dbus_error_name(e)}")
++            (self.notification_source, "StopNotify"),
++            (self.notification_source, "StartNotify"),
++        ]
++
++    def subscribe_is_current(self, generation: int) -> bool:
++        return (
++            generation == self.generation
++            and self.communicator is None
++            and self.connected
++        )
++
++    def start_subscribe(self, generation: int, attempt: int) -> bool:
++        if not self.subscribe_is_current(generation):
++            log.debug(f"Subscribe attempt {generation} superseded.")
+             return False
++        log.info(f"Asking for notifications (attempt {generation}.{attempt})...")
++        self.run_subscribe_steps(generation, attempt, self.subscribe_steps())
++        return False  # also used as a one-shot GLib timeout callback
++
++    def run_subscribe_steps(
++        self, generation: int, attempt: int, steps: List[Tuple[Any, str]]
++    ) -> None:
++        if not self.subscribe_is_current(generation):
++            log.debug(f"Subscribe attempt {generation} superseded.")
++            return
++        if not steps:
++            self.finish_subscribe(generation)
++            return
++        proxy, method = steps[0]
++
++        def done(call: Callable[[], Any]) -> None:
++            try:
++                call()
++            except Exception as e:
++                self.subscribe_failed(generation, attempt, f"{method}: {e}")
++                return
++            self.run_subscribe_steps(generation, attempt, steps[1:])
++
++        try:
++            getattr(proxy, method)(callback=done, timeout=CALL_TIMEOUT_MS)
++        except Exception as e:
++            self.subscribe_failed(generation, attempt, f"{method}: {e}")
+ 
++    def subscribe_failed(self, generation: int, attempt: int, error: str) -> None:
++        if not self.subscribe_is_current(generation):
++            return
++        log.warning(f"Subscribe attempt {generation}.{attempt} failed: {error}")
++        if attempt >= SUBSCRIBE_MAX_ATTEMPTS:
++            log.error("Failed to subscribe to notifications; waiting for a reconnect.")
++            return
++        GLib.timeout_add_seconds(
++            SUBSCRIBE_RETRY_SECONDS, self.start_subscribe, generation, attempt + 1
++        )
++
++    def finish_subscribe(self, generation: int) -> None:
+         comm = DeviceCommunicator(self)
+         comm.attach()
+         self.communicator = comm
+         self.actionable.clear()
++        log.info(f"Asking for notifications: success (attempt {generation}).")
+         self.server.emit_subscribed(self.path)
+ 
+-        return True
+-
+     def handle_action(self, notification_id: int, is_positive: bool) -> None:
+         if self.communicator is None:
+             raise InvalidAction("Phone is not connected/subscribed")
+diff --git a/ancs4linux/observer/device_comm.py b/ancs4linux/observer/device_comm.py
+index ba33732..9bd7b1e 100644
+--- a/ancs4linux/observer/device_comm.py
++++ b/ancs4linux/observer/device_comm.py
+@@ -1,8 +1,8 @@
++import logging
+ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
+ 
+ from ancs4linux.common.apis import ShowNotificationData
+-from ancs4linux.common.dbus import InvalidAction
+-from ancs4linux.common.dbus import Variant
++from ancs4linux.common.dbus import InvalidAction, Variant
+ from ancs4linux.observer.ancs.builders import (
+     GetAppAttributes,
+     GetNotificationAttributes,
+@@ -21,6 +21,11 @@ from ancs4linux.observer.ancs.parsers import (
+     NotificationAttributes,
+ )
+ 
++log = logging.getLogger(__name__)
++
++# Same limit as device.py; dasbus's default is to wait forever.
++CALL_TIMEOUT_MS = 10_000
++
+ CATEGORY_NAMES = {
+     value: name
+     for name, value in vars(CategoryID).items()
+@@ -42,6 +47,10 @@ class DeviceCommunicator:
+         self.notification_queue: List[ShowNotificationData] = []
+         self.awaiting_app_names: Set[str] = set()
+         self.known_app_names: Dict[str, str] = dict()
++        # Control point writes waiting to be sent, one at a time (see write_control_point).
++        self.write_queue: List[Tuple[List[int], str]] = []
++        self.write_in_flight = False
++        self.detached = False
+         # Notification Source events awaiting their attributes, by iOS notification UID.
+         self.pending_events: Dict[int, Notification] = dict()
+ 
+@@ -57,6 +66,8 @@ class DeviceCommunicator:
+         self.data_source.PropertiesChanged.connect(self.on_ds_change)
+ 
+     def detach(self) -> None:
++        self.detached = True
++        self.write_queue.clear()
+         self.notification_source.PropertiesChanged.disconnect(self.on_ns_change)
+         self.data_source.PropertiesChanged.disconnect(self.on_ds_change)
+ 
+@@ -102,8 +113,39 @@ class DeviceCommunicator:
+             get_positive_action=notification.has_positive_action(),
+             get_negative_action=notification.has_negative_action(),
+         )
++        self.write_control_point(msg.to_list(), "notification attributes")
++
++    def write_control_point(self, value: List[int], what: str) -> None:
++        # Asynchronous with a time limit (see device.py): a reply that never comes must not
++        # freeze the observer. bluetoothd allows one outstanding write per characteristic
++        # ("In Progress" otherwise), so writes are queued and sent one at a time -- a
++        # reconnect's full list means dozens of them at once.
++        self.write_queue.append((value, what))
++        if not self.write_in_flight:
++            self.send_next_write()
++
++    def send_next_write(self) -> None:
++        if not self.write_queue or self.detached:
++            self.write_in_flight = False
++            return
+         assert self.device.control_point
+-        self.device.control_point.WriteValue(msg.to_list(), {})
++        value, what = self.write_queue.pop(0)
++        self.write_in_flight = True
++
++        def done(call: Any) -> None:
++            try:
++                call()
++            except Exception as e:
++                log.warning(f"Control point write ({what}) failed: {e}")
++            self.send_next_write()
++
++        try:
++            self.device.control_point.WriteValue(
++                value, {}, callback=done, timeout=CALL_TIMEOUT_MS
++            )
++        except Exception as e:
++            log.warning(f"Control point write ({what}) failed: {e}")
++            self.send_next_write()
+ 
+     def on_ds_change(
+         self, interface: str, changes: Dict[str, Variant], invalidated: List[str]
+@@ -155,8 +197,7 @@ class DeviceCommunicator:
+     def ask_for_app_name(self, app_id: str) -> None:
+         self.awaiting_app_names.add(app_id)
+         msg = GetAppAttributes(app_id=app_id)
+-        assert self.device.control_point
+-        self.device.control_point.WriteValue(msg.to_list(), {})
++        self.write_control_point(msg.to_list(), "app attributes")
+ 
+     def process_queue(self) -> None:
+         unprocessed = []
+@@ -189,4 +230,5 @@ class DeviceCommunicator:
+         id = (notification_id - self.device.id_base) % UINT_MAX
+         msg = PerformNotificationAction(notification_id=id, is_positive=is_positive)
+         assert self.device.control_point
+-        self.device.control_point.WriteValue(msg.to_list(), {})
++        # Synchronous so the caller hears about iOS rejecting it, but never unbounded.
++        self.device.control_point.WriteValue(msg.to_list(), {}, timeout=CALL_TIMEOUT_MS)
+diff --git a/ancs4linux/observer/main.py b/ancs4linux/observer/main.py
+index 3e79dd6..136f268 100644
+--- a/ancs4linux/observer/main.py
++++ b/ancs4linux/observer/main.py
+@@ -1,6 +1,9 @@
+ import logging
++import os
++import socket
+ 
+ import typer
++from gi.repository import GLib  # type: ignore # dynamic
+ 
+ from ancs4linux.common.dbus import EventLoop, SystemBus
+ from ancs4linux.observer.scanner import Scanner
+@@ -25,4 +28,27 @@ def main(
+ 
+     log.info("Observing devices...")
+     scanner.start_observing()
++    start_watchdog()
+     loop.run()
++
++
++def start_watchdog() -> None:
++    """Ping systemd's watchdog from the main loop (added on fe-pro).
++
++    The pings only go out while the loop is running, so if anything blocks it again,
++    systemd (WatchdogSec= in the unit) restarts the observer instead of it hanging silently.
++    """
++    usec = os.environ.get("WATCHDOG_USEC")
++    path = os.environ.get("NOTIFY_SOCKET")
++    if not usec or not path:
++        return
++    address = "\0" + path[1:] if path.startswith("@") else path
++    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
++
++    def ping() -> bool:
++        sock.sendto(b"WATCHDOG=1", address)
++        return True
++
++    ping()
++    GLib.timeout_add(max(1000, int(usec) // 3000), ping)
++    log.info(f"systemd watchdog: pinging every {max(1, int(usec) // 3_000_000)} s")
+-- 
+2.43.0
+

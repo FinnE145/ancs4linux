@@ -1,0 +1,33 @@
+From 47f5e4404ba9c5d2bc8c84753cf97b7d038eff56 Mon Sep 17 00:00:00 2001
+From: FinnE145 <finne014@gmail.com>
+Date: Fri, 2 Oct 2026 01:12:45 +0000
+Subject: [PATCH] scanner: keep watching a device when a non-Device1 interface
+ is removed
+
+iPhones expose Battery1 on the device path; it is removed on every
+disconnect, which made remove_observers() drop the Device1 watcher, so
+reconnects were never noticed and notifications never resumed.
+
+---
+ ancs4linux/observer/scanner.py | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/ancs4linux/observer/scanner.py b/ancs4linux/observer/scanner.py
+index 29ca4c1..d87c0a9 100644
+--- a/ancs4linux/observer/scanner.py
++++ b/ancs4linux/observer/scanner.py
+@@ -76,6 +76,11 @@ class Scanner:
+             return
+ 
+     def remove_observers(self, path: ObjPath, services: List[Str]) -> None:
++        # Only forget the device when Device1 itself goes away. Other interfaces on the
++        # device path (e.g. Battery1) disappear on every disconnect, and dropping the
++        # watcher then means a reconnect is never noticed.
++        if BluezDeviceAPI.interface not in services:
++            return
+         if path in self.property_observers:
+             self.property_observers[path].PropertiesChanged.disconnect()
+             del self.property_observers[path]
+-- 
+2.43.0
+

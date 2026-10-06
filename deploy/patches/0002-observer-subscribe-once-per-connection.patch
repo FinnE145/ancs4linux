@@ -1,0 +1,95 @@
+From 51a6af6fc8de500797d7b60a9889782737ce6d1e Mon Sep 17 00:00:00 2001
+From: FinnE145 <finne014@gmail.com>
+Date: Fri, 2 Oct 2026 01:22:58 +0000
+Subject: [PATCH] observer: subscribe once per connection
+
+After a reconnect BlueZ re-announces the device and each ANCS
+characteristic separately; each announcement started its own subscribe
+attempt, and each successful one attached handlers, so every
+notification was emitted once per attempt (4x observed). Only the
+newest attempt now attaches, and replacing a communicator detaches the
+old one's handlers.
+
+---
+ ancs4linux/observer/device.py      | 16 +++++++++++++---
+ ancs4linux/observer/device_comm.py | 16 ++++++++++++----
+ 2 files changed, 25 insertions(+), 7 deletions(-)
+
+diff --git a/ancs4linux/observer/device.py b/ancs4linux/observer/device.py
+index 0e0de79..9e6c956 100644
+--- a/ancs4linux/observer/device.py
++++ b/ancs4linux/observer/device.py
+@@ -15,6 +15,9 @@ class MobileDevice:
+         self.server = server
+         self.path = path
+         self.communicator: Optional[DeviceCommunicator] = None
++        # Bumped by every subscribe attempt; an attempt that finds it has been superseded
++        # stops without attaching, so only the newest one ends up subscribed.
++        self.generation = 0
+ 
+         self.paired = False
+         self.connected = False
+@@ -54,6 +57,8 @@ class MobileDevice:
+         self.try_subscribe()
+ 
+     def unsubscribe(self) -> None:
++        if self.communicator is not None:
++            self.communicator.detach()
+         self.communicator = None
+ 
+     def try_subscribe(self) -> None:
+@@ -71,16 +76,21 @@ class MobileDevice:
+         ):
+             return
+ 
+-        log.info("Asking for notifications...")
++        self.generation += 1
++        generation = self.generation
++        log.info(f"Asking for notifications (attempt {generation})...")
+         TaskRestarter(
+             120,
+             1,
+-            self.try_asking,
++            lambda: self.try_asking(generation),
+             lambda: log.info("Asking for notifications: success."),
+             lambda: log.error("Failed to subscribe to notifications."),
+         ).try_running_bg()
+ 
+-    def try_asking(self) -> bool:
++    def try_asking(self, generation: int) -> bool:
++        if generation != self.generation or self.communicator is not None:
++            log.debug(f"Subscribe attempt {generation} superseded.")
++            return True
+         assert self.notification_source and self.control_point and self.data_source
+         try:
+             # FIXME: blocking here (e.g. due to device not responding) can lock our program.
+diff --git a/ancs4linux/observer/device_comm.py b/ancs4linux/observer/device_comm.py
+index 3e99676..614dd58 100644
+--- a/ancs4linux/observer/device_comm.py
++++ b/ancs4linux/observer/device_comm.py
+@@ -30,10 +30,18 @@ class DeviceCommunicator:
+ 
+     def attach(self) -> None:
+         assert self.device.notification_source and self.device.data_source
+-        self.device.notification_source.PropertiesChanged.disconnect()
+-        self.device.notification_source.PropertiesChanged.connect(self.on_ns_change)
+-        self.device.data_source.PropertiesChanged.disconnect()
+-        self.device.data_source.PropertiesChanged.connect(self.on_ds_change)
++        # Keep the proxies we attached to: the device may swap in new ones on reconnect,
++        # and detach() must remove our handlers from these, not from the new ones.
++        self.notification_source = self.device.notification_source
++        self.data_source = self.device.data_source
++        self.notification_source.PropertiesChanged.disconnect()
++        self.notification_source.PropertiesChanged.connect(self.on_ns_change)
++        self.data_source.PropertiesChanged.disconnect()
++        self.data_source.PropertiesChanged.connect(self.on_ds_change)
++
++    def detach(self) -> None:
++        self.notification_source.PropertiesChanged.disconnect(self.on_ns_change)
++        self.data_source.PropertiesChanged.disconnect(self.on_ds_change)
+ 
+     def on_ns_change(
+         self, interface: str, changes: Dict[str, Variant], invalidated: List[str]
+-- 
+2.43.0
+
