@@ -43,7 +43,7 @@ PAIRING_WINDOW = "/run/ancs4linux-pairing"
 CALL_TIMEOUT_MS = 10_000  # dasbus's default is to wait forever
 RETRY_SECONDS = 5
 RECHECK_SECONDS = 30
-STALE_CHECK_SECONDS = 15
+STALE_CHECK_SECONDS = 5  # a real connection reaches bluetoothd in well under 1 s
 # Adapter properties that must stay off outside a pairing window.
 CLOSED = ("Pairable", "Discoverable", "Connectable")
 
