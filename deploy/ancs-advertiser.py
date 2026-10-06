@@ -11,13 +11,20 @@ Run by ancs4linux-advertise.service (as root) with the ancs4linux venv's Python.
   a periodic recheck. ancs-pair marks its window in PAIRING_WINDOW (the window's end time),
   so a killed ancs-pair can't leave it open. While the adapter is pairable, ancs4linux's
   agent accepts any pairing request.
+- Repairs stale links: when the kernel holds an LE link to a paired phone that bluetoothd
+  says isn't connected (a bluetoothd 5.87 race when the phone reconnects within a fraction
+  of a second of a disconnect: it ignores the new connection, then clears the old one), no
+  notifications can flow on it and nothing else ever notices. Seen on two consecutive
+  checks, the link is closed so the phone reconnects cleanly.
 - Pings systemd's watchdog from the main loop.
 
 Logs only registrations and corrections.
 """
 import logging
 import os
+import re
 import socket
+import subprocess
 import time
 from typing import Any, Dict, List
 
@@ -36,6 +43,7 @@ PAIRING_WINDOW = "/run/ancs4linux-pairing"
 CALL_TIMEOUT_MS = 10_000  # dasbus's default is to wait forever
 RETRY_SECONDS = 5
 RECHECK_SECONDS = 30
+STALE_CHECK_SECONDS = 15
 # Adapter properties that must stay off outside a pairing window.
 CLOSED = ("Pairable", "Discoverable", "Connectable")
 
@@ -73,6 +81,7 @@ class Advertiser:
         self.bus = bus
         self.registered = False
         self.retry_pending = False
+        self.stale_suspects: Dict[str, int] = {}  # LE handle -> consecutive sightings
         self.adapter = bus.get_proxy("org.bluez", ADAPTER)
         self.properties = bus.get_proxy(
             "org.bluez", ADAPTER, interface_name="org.freedesktop.DBus.Properties"
@@ -195,6 +204,48 @@ class Advertiser:
             self.schedule_register()
 
 
+    # --- stale links ----------------------------------------------------------------
+    def check_stale_links(self) -> bool:
+        try:
+            out = subprocess.run(
+                ["hcitool", "con"], capture_output=True, text=True, timeout=5
+            ).stdout
+        except Exception as e:
+            log.warning(f"couldn't list connections: {e}")
+            return True
+        links = re.findall(r"> LE ([0-9A-F:]{17}) handle (\d+)", out)
+        current = {handle for _, handle in links}
+        self.stale_suspects = {h: n for h, n in self.stale_suspects.items() if h in current}
+        for mac, handle in links:
+            device = f"{ADAPTER}/dev_{mac.replace(':', '_')}"
+            props = self.bus.get_proxy(
+                "org.bluez", device, interface_name="org.freedesktop.DBus.Properties"
+            )
+
+            def done(call: Any, mac: str = mac, handle: str = handle) -> None:
+                try:
+                    state = call()
+                except Exception:
+                    return  # not a device bluetoothd knows; not ours to judge
+                paired = state.get("Paired")
+                connected = state.get("Connected")
+                if not (paired and paired.unpack()) or connected is None or connected.unpack():
+                    self.stale_suspects.pop(handle, None)
+                    return
+                seen = self.stale_suspects.get(handle, 0) + 1
+                self.stale_suspects[handle] = seen
+                if seen >= 2:
+                    log.warning(
+                        f"stale LE link to {mac} (handle {handle}): kernel connected, "
+                        "bluetoothd not; closing it so the phone reconnects cleanly"
+                    )
+                    self.stale_suspects.pop(handle, None)
+                    subprocess.run(["hcitool", "ledc", handle], timeout=5)
+
+            props.GetAll("org.bluez.Device1", callback=done, timeout=CALL_TIMEOUT_MS)
+        return True
+
+
 def start_watchdog() -> None:
     usec = os.environ.get("WATCHDOG_USEC")
     path = os.environ.get("NOTIFY_SOCKET")
@@ -218,6 +269,7 @@ def main() -> None:
     advertiser.register()
     advertiser.enforce_closed()
     GLib.timeout_add_seconds(RECHECK_SECONDS, advertiser.enforce_closed)
+    GLib.timeout_add_seconds(STALE_CHECK_SECONDS, advertiser.check_stale_links)
     start_watchdog()
     EventLoop().run()
 
