@@ -199,14 +199,18 @@ class DeviceCommunicator:
         msg = GetAppAttributes(app_id=app_id)
         self.write_control_point(msg.to_list(), "app attributes")
 
+    def emit_show(self, data: ShowNotificationData) -> None:
+        self.device.note_shown()
+        self.device.server.emit_show_notification(data)
+
     def process_queue(self) -> None:
         unprocessed = []
         for data in self.notification_queue:
             if data.app_name != "":
-                self.device.server.emit_show_notification(data)
+                self.emit_show(data)
             elif data.app_id in self.known_app_names:
                 data.app_name = self.known_app_names[data.app_id]
-                self.device.server.emit_show_notification(data)
+                self.emit_show(data)
             elif data.app_id in self.awaiting_app_names:
                 unprocessed.append(data)
             else:

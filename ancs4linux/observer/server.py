@@ -1,3 +1,5 @@
+import json
+
 from ancs4linux.common.apis import ObserverAPI
 from ancs4linux.common.dbus import (
     Bool,
@@ -7,6 +9,7 @@ from ancs4linux.common.dbus import (
     dbus_interface,
     dbus_signal,
 )
+from ancs4linux.observer.device import OBSERVER_STARTED, now_iso
 from ancs4linux.observer.scanner import Scanner
 
 
@@ -35,3 +38,25 @@ class ObserverServer(ObserverAPI):
     @dbus_signal
     def Subscribed(self, device_handle: Str) -> None:
         pass
+
+    @dbus_signal
+    def Connected(self, device_handle: Str) -> None:
+        pass
+
+    @dbus_signal
+    def Disconnected(self, device_handle: Str) -> None:
+        pass
+
+    @dbus_signal
+    def SubscribeFailed(self, device_handle: Str, error: Str) -> None:
+        pass
+
+    def GetStatus(self) -> Str:
+        devices = list(self.scanner.devices.values()) if self.scanner else []
+        return json.dumps(
+            {
+                "observer_started": OBSERVER_STARTED,
+                "now": now_iso(),
+                "devices": [device.status() for device in devices],
+            }
+        )

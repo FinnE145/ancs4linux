@@ -1,5 +1,7 @@
 import logging
 import random
+from collections import deque
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from gi.repository import GLib  # type: ignore # dynamic
@@ -10,6 +12,15 @@ from ancs4linux.common.external_apis import BluezGattCharacteristicAPI
 from ancs4linux.observer.device_comm import DeviceCommunicator
 
 log = logging.getLogger(__name__)
+
+HISTORY_LENGTH = 50
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+OBSERVER_STARTED = now_iso()
 
 # Every call to bluetoothd gets a limit; dasbus's default is to wait forever.
 CALL_TIMEOUT_MS = 10_000
@@ -33,6 +44,16 @@ class MobileDevice:
         # {id: (positive, negative)}. Reset on each fresh subscription and rebuilt from
         # the full list iOS then sends.
         self.actionable: Dict[int, Tuple[bool, bool]] = dict()
+        # Facts for GetStatus() (UTC ISO timestamps; None = not known, e.g. the phone was
+        # already connected when the observer started).
+        self.connected_since: Optional[str] = None
+        self.last_disconnected: Optional[str] = None
+        self.subscribed_since: Optional[str] = None
+        self.shown_since_subscribed = 0
+        self.last_notification: Optional[str] = None
+        self.subscribe_failures = 0  # on the current connection
+        self.last_subscribe_error: Optional[str] = None
+        self.history: deque = deque(maxlen=HISTORY_LENGTH)
 
         self.paired = False
         self.connected = False
@@ -63,8 +84,49 @@ class MobileDevice:
 
     def set_connected(self, connected: bool) -> None:
         self.unsubscribe()
+        if connected != self.connected:
+            self.record_connection(connected)
         self.connected = connected
         self.try_subscribe()
+
+    def record_connection(self, connected: bool) -> None:
+        if connected:
+            self.connected_since = now_iso()
+            self.subscribe_failures = 0
+            self.last_subscribe_error = None
+            self.note("connected")
+            self.server.emit_connected(self.path)
+        else:
+            self.last_disconnected = now_iso()
+            self.connected_since = None
+            self.subscribed_since = None
+            self.shown_since_subscribed = 0
+            self.note("disconnected")
+            self.server.emit_disconnected(self.path)
+
+    def note(self, event: str, **fields: Any) -> None:
+        self.history.append({"ts": now_iso(), "event": event, **fields})
+
+    def note_shown(self) -> None:
+        self.shown_since_subscribed += 1
+        self.last_notification = now_iso()
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "device": self.path,
+            "name": self.name,
+            "paired": self.paired,
+            "connected": self.connected,
+            "connected_since": self.connected_since,
+            "last_disconnected": self.last_disconnected,
+            "subscribed": self.communicator is not None,
+            "subscribed_since": self.subscribed_since,
+            "shown_since_subscribed": self.shown_since_subscribed,
+            "last_notification": self.last_notification,
+            "subscribe_failures": self.subscribe_failures,
+            "last_subscribe_error": self.last_subscribe_error,
+            "history": list(self.history),
+        }
 
     def set_name(self, name: str) -> None:
         # No self.unsubscribe(): name change is innocent
@@ -153,8 +215,12 @@ class MobileDevice:
         if not self.subscribe_is_current(generation):
             return
         log.warning(f"Subscribe attempt {generation}.{attempt} failed: {error}")
+        self.subscribe_failures += 1
+        self.last_subscribe_error = error
         if attempt >= SUBSCRIBE_MAX_ATTEMPTS:
             log.error("Failed to subscribe to notifications; waiting for a reconnect.")
+            self.note("subscribe_failed", error=error)
+            self.server.emit_subscribe_failed(self.path, error)
             return
         GLib.timeout_add_seconds(
             SUBSCRIBE_RETRY_SECONDS, self.start_subscribe, generation, attempt + 1
@@ -165,6 +231,9 @@ class MobileDevice:
         comm.attach()
         self.communicator = comm
         self.actionable.clear()
+        self.subscribed_since = now_iso()
+        self.shown_since_subscribed = 0
+        self.note("subscribed")
         log.info(f"Asking for notifications: success (attempt {generation}).")
         self.server.emit_subscribed(self.path)
 

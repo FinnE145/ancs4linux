@@ -83,6 +83,29 @@ class ObserverAPI(ABC):
 
     Subscribed: Signal
 
+    # Added on fe-pro: connection facts for consumers (the bridge decides what they mean).
+    def emit_connected(self, device_handle: str) -> None:
+        self.Connected(device_handle)
+
+    Connected: Signal
+
+    def emit_disconnected(self, device_handle: str) -> None:
+        self.Disconnected(device_handle)
+
+    Disconnected: Signal
+
+    # Subscribing gave up (after its retries) on this connection; next try is on reconnect.
+    def emit_subscribe_failed(self, device_handle: str, error: str) -> None:
+        self.SubscribeFailed(device_handle, error)
+
+    SubscribeFailed: Signal
+
+    # JSON snapshot of every known device's connection and subscription state, with a
+    # short event history. See MobileDevice.status().
+    @abstractmethod
+    def GetStatus(self) -> Str:
+        pass
+
 
 class AdvertisingAPI(ABC):
     interface = "ancs4linux.Advertising"
