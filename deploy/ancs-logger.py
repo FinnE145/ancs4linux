@@ -66,6 +66,11 @@ def on_subscribed(conn, sender, path, iface, member, params):
     write("subscribed", device=params.unpack()[0])
 
 
+def on_subscribe_failed(conn, sender, path, iface, member, params):
+    device, error = params.unpack()
+    write("subscribe_failed", device=device, error=error)
+
+
 def on_pairing_code(conn, sender, path, iface, member, params):
     write("pairing_code", pin=params.unpack()[0])
 
@@ -86,6 +91,7 @@ def main():
         ("ancs4linux.Observer", "ancs4linux.Observer", "ShowNotification", None, on_show),
         ("ancs4linux.Observer", "ancs4linux.Observer", "DismissNotification", None, on_dismiss),
         ("ancs4linux.Observer", "ancs4linux.Observer", "Subscribed", None, on_subscribed),
+        ("ancs4linux.Observer", "ancs4linux.Observer", "SubscribeFailed", None, on_subscribe_failed),
         ("ancs4linux.Advertising", "ancs4linux.Advertising", "PairingCode", None, on_pairing_code),
         ("org.bluez", "org.freedesktop.DBus.Properties", "PropertiesChanged", "org.bluez.Device1", on_bluez_props),
     ]

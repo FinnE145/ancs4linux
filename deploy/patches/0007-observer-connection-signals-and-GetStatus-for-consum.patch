@@ -1,0 +1,245 @@
+From 3f6ba0b23f0ec262a6b9dc500f0907c7cbcb0b49 Mon Sep 17 00:00:00 2001
+From: FinnE145 <finne014@gmail.com>
+Date: Tue, 6 Oct 2026 17:33:20 +0000
+Subject: [PATCH] observer: connection signals and GetStatus() for consumers
+
+Adds Connected(device), Disconnected(device) and
+SubscribeFailed(device, error) signals, and a GetStatus() method
+returning JSON per device: connected and since when, last disconnect,
+subscribed and since when, notifications shown since then, last
+notification time, subscribe failures on this connection and the last
+error, plus the last 50 connect/disconnect/subscribe events. Facts only
+(UTC timestamps, null when unknown); what they mean is up to consumers.
+
+---
+ ancs4linux/common/apis.py          | 23 ++++++++++
+ ancs4linux/observer/device.py      | 69 ++++++++++++++++++++++++++++++
+ ancs4linux/observer/device_comm.py |  8 +++-
+ ancs4linux/observer/server.py      | 25 +++++++++++
+ 4 files changed, 123 insertions(+), 2 deletions(-)
+
+diff --git a/ancs4linux/common/apis.py b/ancs4linux/common/apis.py
+index d6f5c7f..5e7ff1e 100644
+--- a/ancs4linux/common/apis.py
++++ b/ancs4linux/common/apis.py
+@@ -83,6 +83,29 @@ class ObserverAPI(ABC):
+ 
+     Subscribed: Signal
+ 
++    # Added on fe-pro: connection facts for consumers (the bridge decides what they mean).
++    def emit_connected(self, device_handle: str) -> None:
++        self.Connected(device_handle)
++
++    Connected: Signal
++
++    def emit_disconnected(self, device_handle: str) -> None:
++        self.Disconnected(device_handle)
++
++    Disconnected: Signal
++
++    # Subscribing gave up (after its retries) on this connection; next try is on reconnect.
++    def emit_subscribe_failed(self, device_handle: str, error: str) -> None:
++        self.SubscribeFailed(device_handle, error)
++
++    SubscribeFailed: Signal
++
++    # JSON snapshot of every known device's connection and subscription state, with a
++    # short event history. See MobileDevice.status().
++    @abstractmethod
++    def GetStatus(self) -> Str:
++        pass
++
+ 
+ class AdvertisingAPI(ABC):
+     interface = "ancs4linux.Advertising"
+diff --git a/ancs4linux/observer/device.py b/ancs4linux/observer/device.py
+index 9811341..2991d91 100644
+--- a/ancs4linux/observer/device.py
++++ b/ancs4linux/observer/device.py
+@@ -1,5 +1,7 @@
+ import logging
+ import random
++from collections import deque
++from datetime import datetime, timezone
+ from typing import Any, Callable, Dict, List, Optional, Tuple
+ 
+ from gi.repository import GLib  # type: ignore # dynamic
+@@ -11,6 +13,15 @@ from ancs4linux.observer.device_comm import DeviceCommunicator
+ 
+ log = logging.getLogger(__name__)
+ 
++HISTORY_LENGTH = 50
++
++
++def now_iso() -> str:
++    return datetime.now(timezone.utc).isoformat(timespec="seconds")
++
++
++OBSERVER_STARTED = now_iso()
++
+ # Every call to bluetoothd gets a limit; dasbus's default is to wait forever.
+ CALL_TIMEOUT_MS = 10_000
+ SUBSCRIBE_RETRY_SECONDS = 2
+@@ -33,6 +44,16 @@ class MobileDevice:
+         # {id: (positive, negative)}. Reset on each fresh subscription and rebuilt from
+         # the full list iOS then sends.
+         self.actionable: Dict[int, Tuple[bool, bool]] = dict()
++        # Facts for GetStatus() (UTC ISO timestamps; None = not known, e.g. the phone was
++        # already connected when the observer started).
++        self.connected_since: Optional[str] = None
++        self.last_disconnected: Optional[str] = None
++        self.subscribed_since: Optional[str] = None
++        self.shown_since_subscribed = 0
++        self.last_notification: Optional[str] = None
++        self.subscribe_failures = 0  # on the current connection
++        self.last_subscribe_error: Optional[str] = None
++        self.history: deque = deque(maxlen=HISTORY_LENGTH)
+ 
+         self.paired = False
+         self.connected = False
+@@ -63,9 +84,50 @@ class MobileDevice:
+ 
+     def set_connected(self, connected: bool) -> None:
+         self.unsubscribe()
++        if connected != self.connected:
++            self.record_connection(connected)
+         self.connected = connected
+         self.try_subscribe()
+ 
++    def record_connection(self, connected: bool) -> None:
++        if connected:
++            self.connected_since = now_iso()
++            self.subscribe_failures = 0
++            self.last_subscribe_error = None
++            self.note("connected")
++            self.server.emit_connected(self.path)
++        else:
++            self.last_disconnected = now_iso()
++            self.connected_since = None
++            self.subscribed_since = None
++            self.shown_since_subscribed = 0
++            self.note("disconnected")
++            self.server.emit_disconnected(self.path)
++
++    def note(self, event: str, **fields: Any) -> None:
++        self.history.append({"ts": now_iso(), "event": event, **fields})
++
++    def note_shown(self) -> None:
++        self.shown_since_subscribed += 1
++        self.last_notification = now_iso()
++
++    def status(self) -> Dict[str, Any]:
++        return {
++            "device": self.path,
++            "name": self.name,
++            "paired": self.paired,
++            "connected": self.connected,
++            "connected_since": self.connected_since,
++            "last_disconnected": self.last_disconnected,
++            "subscribed": self.communicator is not None,
++            "subscribed_since": self.subscribed_since,
++            "shown_since_subscribed": self.shown_since_subscribed,
++            "last_notification": self.last_notification,
++            "subscribe_failures": self.subscribe_failures,
++            "last_subscribe_error": self.last_subscribe_error,
++            "history": list(self.history),
++        }
++
+     def set_name(self, name: str) -> None:
+         # No self.unsubscribe(): name change is innocent
+         self.name = name
+@@ -153,8 +215,12 @@ class MobileDevice:
+         if not self.subscribe_is_current(generation):
+             return
+         log.warning(f"Subscribe attempt {generation}.{attempt} failed: {error}")
++        self.subscribe_failures += 1
++        self.last_subscribe_error = error
+         if attempt >= SUBSCRIBE_MAX_ATTEMPTS:
+             log.error("Failed to subscribe to notifications; waiting for a reconnect.")
++            self.note("subscribe_failed", error=error)
++            self.server.emit_subscribe_failed(self.path, error)
+             return
+         GLib.timeout_add_seconds(
+             SUBSCRIBE_RETRY_SECONDS, self.start_subscribe, generation, attempt + 1
+@@ -165,6 +231,9 @@ class MobileDevice:
+         comm.attach()
+         self.communicator = comm
+         self.actionable.clear()
++        self.subscribed_since = now_iso()
++        self.shown_since_subscribed = 0
++        self.note("subscribed")
+         log.info(f"Asking for notifications: success (attempt {generation}).")
+         self.server.emit_subscribed(self.path)
+ 
+diff --git a/ancs4linux/observer/device_comm.py b/ancs4linux/observer/device_comm.py
+index 9bd7b1e..dfe207f 100644
+--- a/ancs4linux/observer/device_comm.py
++++ b/ancs4linux/observer/device_comm.py
+@@ -199,14 +199,18 @@ class DeviceCommunicator:
+         msg = GetAppAttributes(app_id=app_id)
+         self.write_control_point(msg.to_list(), "app attributes")
+ 
++    def emit_show(self, data: ShowNotificationData) -> None:
++        self.device.note_shown()
++        self.device.server.emit_show_notification(data)
++
+     def process_queue(self) -> None:
+         unprocessed = []
+         for data in self.notification_queue:
+             if data.app_name != "":
+-                self.device.server.emit_show_notification(data)
++                self.emit_show(data)
+             elif data.app_id in self.known_app_names:
+                 data.app_name = self.known_app_names[data.app_id]
+-                self.device.server.emit_show_notification(data)
++                self.emit_show(data)
+             elif data.app_id in self.awaiting_app_names:
+                 unprocessed.append(data)
+             else:
+diff --git a/ancs4linux/observer/server.py b/ancs4linux/observer/server.py
+index ccb049b..bd6b1a0 100644
+--- a/ancs4linux/observer/server.py
++++ b/ancs4linux/observer/server.py
+@@ -1,3 +1,5 @@
++import json
++
+ from ancs4linux.common.apis import ObserverAPI
+ from ancs4linux.common.dbus import (
+     Bool,
+@@ -7,6 +9,7 @@ from ancs4linux.common.dbus import (
+     dbus_interface,
+     dbus_signal,
+ )
++from ancs4linux.observer.device import OBSERVER_STARTED, now_iso
+ from ancs4linux.observer.scanner import Scanner
+ 
+ 
+@@ -35,3 +38,25 @@ class ObserverServer(ObserverAPI):
+     @dbus_signal
+     def Subscribed(self, device_handle: Str) -> None:
+         pass
++
++    @dbus_signal
++    def Connected(self, device_handle: Str) -> None:
++        pass
++
++    @dbus_signal
++    def Disconnected(self, device_handle: Str) -> None:
++        pass
++
++    @dbus_signal
++    def SubscribeFailed(self, device_handle: Str, error: Str) -> None:
++        pass
++
++    def GetStatus(self) -> Str:
++        devices = list(self.scanner.devices.values()) if self.scanner else []
++        return json.dumps(
++            {
++                "observer_started": OBSERVER_STARTED,
++                "now": now_iso(),
++                "devices": [device.status() for device in devices],
++            }
++        )
+-- 
+2.43.0
+
