@@ -1,8 +1,8 @@
+import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 from ancs4linux.common.apis import ShowNotificationData
-from ancs4linux.common.dbus import InvalidAction
-from ancs4linux.common.dbus import Variant
+from ancs4linux.common.dbus import InvalidAction, Variant
 from ancs4linux.observer.ancs.builders import (
     GetAppAttributes,
     GetNotificationAttributes,
@@ -20,6 +20,11 @@ from ancs4linux.observer.ancs.parsers import (
     Notification,
     NotificationAttributes,
 )
+
+log = logging.getLogger(__name__)
+
+# Same limit as device.py; dasbus's default is to wait forever.
+CALL_TIMEOUT_MS = 10_000
 
 CATEGORY_NAMES = {
     value: name
@@ -42,6 +47,10 @@ class DeviceCommunicator:
         self.notification_queue: List[ShowNotificationData] = []
         self.awaiting_app_names: Set[str] = set()
         self.known_app_names: Dict[str, str] = dict()
+        # Control point writes waiting to be sent, one at a time (see write_control_point).
+        self.write_queue: List[Tuple[List[int], str]] = []
+        self.write_in_flight = False
+        self.detached = False
         # Notification Source events awaiting their attributes, by iOS notification UID.
         self.pending_events: Dict[int, Notification] = dict()
 
@@ -57,6 +66,8 @@ class DeviceCommunicator:
         self.data_source.PropertiesChanged.connect(self.on_ds_change)
 
     def detach(self) -> None:
+        self.detached = True
+        self.write_queue.clear()
         self.notification_source.PropertiesChanged.disconnect(self.on_ns_change)
         self.data_source.PropertiesChanged.disconnect(self.on_ds_change)
 
@@ -102,8 +113,39 @@ class DeviceCommunicator:
             get_positive_action=notification.has_positive_action(),
             get_negative_action=notification.has_negative_action(),
         )
+        self.write_control_point(msg.to_list(), "notification attributes")
+
+    def write_control_point(self, value: List[int], what: str) -> None:
+        # Asynchronous with a time limit (see device.py): a reply that never comes must not
+        # freeze the observer. bluetoothd allows one outstanding write per characteristic
+        # ("In Progress" otherwise), so writes are queued and sent one at a time -- a
+        # reconnect's full list means dozens of them at once.
+        self.write_queue.append((value, what))
+        if not self.write_in_flight:
+            self.send_next_write()
+
+    def send_next_write(self) -> None:
+        if not self.write_queue or self.detached:
+            self.write_in_flight = False
+            return
         assert self.device.control_point
-        self.device.control_point.WriteValue(msg.to_list(), {})
+        value, what = self.write_queue.pop(0)
+        self.write_in_flight = True
+
+        def done(call: Any) -> None:
+            try:
+                call()
+            except Exception as e:
+                log.warning(f"Control point write ({what}) failed: {e}")
+            self.send_next_write()
+
+        try:
+            self.device.control_point.WriteValue(
+                value, {}, callback=done, timeout=CALL_TIMEOUT_MS
+            )
+        except Exception as e:
+            log.warning(f"Control point write ({what}) failed: {e}")
+            self.send_next_write()
 
     def on_ds_change(
         self, interface: str, changes: Dict[str, Variant], invalidated: List[str]
@@ -155,8 +197,7 @@ class DeviceCommunicator:
     def ask_for_app_name(self, app_id: str) -> None:
         self.awaiting_app_names.add(app_id)
         msg = GetAppAttributes(app_id=app_id)
-        assert self.device.control_point
-        self.device.control_point.WriteValue(msg.to_list(), {})
+        self.write_control_point(msg.to_list(), "app attributes")
 
     def process_queue(self) -> None:
         unprocessed = []
@@ -189,4 +230,5 @@ class DeviceCommunicator:
         id = (notification_id - self.device.id_base) % UINT_MAX
         msg = PerformNotificationAction(notification_id=id, is_positive=is_positive)
         assert self.device.control_point
-        self.device.control_point.WriteValue(msg.to_list(), {})
+        # Synchronous so the caller hears about iOS rejecting it, but never unbounded.
+        self.device.control_point.WriteValue(msg.to_list(), {}, timeout=CALL_TIMEOUT_MS)

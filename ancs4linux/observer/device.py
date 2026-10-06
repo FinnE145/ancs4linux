@@ -1,14 +1,20 @@
 import logging
 import random
-from typing import Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from gi.repository import GLib  # type: ignore # dynamic
 
 from ancs4linux.common.apis import ObserverAPI
-from ancs4linux.common.dbus import InvalidAction, ObjPath, get_dbus_error_name
+from ancs4linux.common.dbus import InvalidAction, ObjPath
 from ancs4linux.common.external_apis import BluezGattCharacteristicAPI
-from ancs4linux.common.task_restarter import TaskRestarter
 from ancs4linux.observer.device_comm import DeviceCommunicator
 
 log = logging.getLogger(__name__)
+
+# Every call to bluetoothd gets a limit; dasbus's default is to wait forever.
+CALL_TIMEOUT_MS = 10_000
+SUBSCRIBE_RETRY_SECONDS = 2
+SUBSCRIBE_MAX_ATTEMPTS = 60
 
 
 class MobileDevice:
@@ -86,47 +92,81 @@ class MobileDevice:
             return
 
         self.generation += 1
-        generation = self.generation
-        log.info(f"Asking for notifications (attempt {generation})...")
-        TaskRestarter(
-            120,
-            1,
-            lambda: self.try_asking(generation),
-            lambda: log.info("Asking for notifications: success."),
-            lambda: log.error("Failed to subscribe to notifications."),
-        ).try_running_bg()
+        self.start_subscribe(self.generation, 1)
 
-    def try_asking(self, generation: int) -> bool:
-        if generation != self.generation or self.communicator is not None:
-            log.debug(f"Subscribe attempt {generation} superseded.")
-            return True
-        assert self.notification_source and self.control_point and self.data_source
-        try:
-            # FIXME: blocking here (e.g. due to device not responding) can lock our program.
-            # Timeouts (timeout=1000 [ms]) do not work.
-            self.data_source.StartNotify()
-            self.notification_source.StartNotify()
+    # Subscribing is a chain of asynchronous calls, each with a time limit. Upstream made
+    # them synchronously with dasbus's default timeout, which is infinite: when bluetoothd
+    # never answered one (seen after a link dropped mid-request), the whole observer froze
+    # for days.
+    def subscribe_steps(self) -> List[Tuple[Any, str]]:
+        return [
+            (self.data_source, "StartNotify"),
+            (self.notification_source, "StartNotify"),
             # iOS only sends its full Notification Center list when the subscription is
             # switched on. After a reconnect BlueZ can restore the old subscription, and
             # then iOS sends nothing: notifications that arrived or were cleared during
             # the gap would be missed. Switching it off and on forces the full list.
-            self.notification_source.StopNotify()
-            self.notification_source.StartNotify()
-        except Exception as e:
-            log.warn(
-                f"Failed to start subscribe to notifications (is phone paired?): {e}"
-            )
-            if get_dbus_error_name(e) is not None:
-                log.warn(f"Original error: {get_dbus_error_name(e)}")
-            return False
+            (self.notification_source, "StopNotify"),
+            (self.notification_source, "StartNotify"),
+        ]
 
+    def subscribe_is_current(self, generation: int) -> bool:
+        return (
+            generation == self.generation
+            and self.communicator is None
+            and self.connected
+        )
+
+    def start_subscribe(self, generation: int, attempt: int) -> bool:
+        if not self.subscribe_is_current(generation):
+            log.debug(f"Subscribe attempt {generation} superseded.")
+            return False
+        log.info(f"Asking for notifications (attempt {generation}.{attempt})...")
+        self.run_subscribe_steps(generation, attempt, self.subscribe_steps())
+        return False  # also used as a one-shot GLib timeout callback
+
+    def run_subscribe_steps(
+        self, generation: int, attempt: int, steps: List[Tuple[Any, str]]
+    ) -> None:
+        if not self.subscribe_is_current(generation):
+            log.debug(f"Subscribe attempt {generation} superseded.")
+            return
+        if not steps:
+            self.finish_subscribe(generation)
+            return
+        proxy, method = steps[0]
+
+        def done(call: Callable[[], Any]) -> None:
+            try:
+                call()
+            except Exception as e:
+                self.subscribe_failed(generation, attempt, f"{method}: {e}")
+                return
+            self.run_subscribe_steps(generation, attempt, steps[1:])
+
+        try:
+            getattr(proxy, method)(callback=done, timeout=CALL_TIMEOUT_MS)
+        except Exception as e:
+            self.subscribe_failed(generation, attempt, f"{method}: {e}")
+
+    def subscribe_failed(self, generation: int, attempt: int, error: str) -> None:
+        if not self.subscribe_is_current(generation):
+            return
+        log.warning(f"Subscribe attempt {generation}.{attempt} failed: {error}")
+        if attempt >= SUBSCRIBE_MAX_ATTEMPTS:
+            log.error("Failed to subscribe to notifications; waiting for a reconnect.")
+            return
+        GLib.timeout_add_seconds(
+            SUBSCRIBE_RETRY_SECONDS, self.start_subscribe, generation, attempt + 1
+        )
+
+    def finish_subscribe(self, generation: int) -> None:
         comm = DeviceCommunicator(self)
         comm.attach()
         self.communicator = comm
         self.actionable.clear()
+        log.info(f"Asking for notifications: success (attempt {generation}).")
         self.server.emit_subscribed(self.path)
-
-        return True
 
     def handle_action(self, notification_id: int, is_positive: bool) -> None:
         if self.communicator is None:
