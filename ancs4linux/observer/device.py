@@ -54,6 +54,11 @@ class MobileDevice:
         self.subscribe_failures = 0  # on the current connection
         self.last_subscribe_error: Optional[str] = None
         self.history: deque = deque(maxlen=HISTORY_LENGTH)
+        self.connection_observed = False
+        # Heard the phone's own advertisements (only while scanning, i.e. disconnected).
+        self.last_seen: Optional[str] = None
+        self.last_rssi: Optional[int] = None
+        self.seen_since_scan_started = False
 
         self.paired = False
         self.connected = False
@@ -84,7 +89,13 @@ class MobileDevice:
 
     def set_connected(self, connected: bool) -> None:
         self.unsubscribe()
-        if connected != self.connected:
+        if not self.connection_observed:
+            # First report after the observer started: when it connected isn't known.
+            self.connection_observed = True
+            if connected:
+                self.note("already_connected")
+                self.server.emit_connected(self.path)
+        elif connected != self.connected:
             self.record_connection(connected)
         self.connected = connected
         self.try_subscribe()
@@ -107,6 +118,17 @@ class MobileDevice:
     def note(self, event: str, **fields: Any) -> None:
         self.history.append({"ts": now_iso(), "event": event, **fields})
 
+    def note_scan_started(self) -> None:
+        self.seen_since_scan_started = False
+        self.note("scan_started")
+
+    def note_seen(self, rssi: int) -> None:
+        self.last_seen = now_iso()
+        self.last_rssi = rssi
+        if not self.seen_since_scan_started:
+            self.seen_since_scan_started = True
+            self.note("seen", rssi=rssi)
+
     def note_shown(self) -> None:
         self.shown_since_subscribed += 1
         self.last_notification = now_iso()
@@ -125,6 +147,8 @@ class MobileDevice:
             "last_notification": self.last_notification,
             "subscribe_failures": self.subscribe_failures,
             "last_subscribe_error": self.last_subscribe_error,
+            "last_seen": self.last_seen,
+            "last_rssi": self.last_rssi,
             "history": list(self.history),
         }
 

@@ -57,6 +57,10 @@ class ObserverServer(ObserverAPI):
             {
                 "observer_started": OBSERVER_STARTED,
                 "now": now_iso(),
-                "devices": [device.status() for device in devices],
+                # LE discovery runs only while no paired phone is connected; last_seen
+                # per device comes from it.
+                "scanning": bool(self.scanner and self.scanner.scanning),
+                "scanning_since": self.scanner.scanning_since if self.scanner else None,
+                "devices": [device.status() for device in devices if device.paired],
             }
         )
