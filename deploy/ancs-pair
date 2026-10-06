@@ -9,11 +9,15 @@ window=${1:-180}
 [ "$EUID" -eq 0 ] || { echo "Run with sudo." >&2; exit 1; }
 adapter() { busctl set-property org.bluez /org/bluez/hci0 org.bluez.Adapter1 "$1" b "$2"; }
 
+monitor_pid=
 close() {
+    [ -n "$monitor_pid" ] && kill "$monitor_pid" 2>/dev/null
+    pkill -P $$ -x dbus-monitor 2>/dev/null
     rm -f /run/ancs4linux-pairing
     adapter Pairable false
     adapter Discoverable false
     adapter Connectable false
+    echo
     echo "Pairing window closed."
 }
 
@@ -21,18 +25,50 @@ systemctl is-active --quiet ancs4linux-advertise || {
     echo "ancs4linux-advertise isn't running; the phone won't be able to connect." >&2
     exit 1
 }
+
+# Phones already bonded: re-pairing one means removing it here first.
+mapfile -t bonded < <(bluetoothctl devices Bonded | awk '{mac=$2; $1=$2=""; sub(/^ +/, ""); print mac "  " $0}')
+if [ ${#bonded[@]} -gt 0 ]; then
+    echo "Already paired with:"
+    for d in "${bonded[@]}"; do echo "    $d"; done
+    echo
+    echo "To pair one of these again, stop here (Ctrl-C), forget fe-pro on the phone, and run:"
+    for d in "${bonded[@]}"; do
+        echo
+        echo "    bluetoothctl remove ${d%% *}"
+    done
+    echo
+fi
+
 trap close EXIT
 # Tell ancs-advertiser to leave the adapter open until the window ends (it closes anything
 # opened outside a window). Written first, so it's in place before anything turns on.
 echo $(( $(date +%s) + window )) > /run/ancs4linux-pairing
+
+# Print the pairing code as soon as the phone asks (ancs4linux emits it as a D-Bus signal).
+dbus-monitor --system "type='signal',interface='ancs4linux.Advertising',member='PairingCode'" 2>/dev/null |
+    while read -r line; do
+        case "$line" in
+            string\ *)
+                code=${line#string \"}; code=${code%\"}
+                printf '\n\n    Pairing code:   %s\n\n    Check the iPhone shows the same code, then tap Pair.\n\n' "$code"
+                ;;
+        esac
+    done &
+monitor_pid=$!
+
 adapter Connectable true
 bluetoothctl discoverable-timeout "$window" >/dev/null
 bluetoothctl pairable on >/dev/null
 bluetoothctl discoverable on >/dev/null
 
-echo "fe-pro is pairable for ${window}s."
-echo "If re-pairing: first forget fe-pro on the iPhone, and run: bluetoothctl remove <phone MAC>"
-echo "On the iPhone: Settings -> Bluetooth -> fe-pro, check the code, Pair, then allow notifications."
-echo "The code also appears in /var/log/ancs4linux/notifications.log (event pairing_code)."
-echo "Press Enter once paired. The phone may show 'not connected' briefly, then reconnects over LE."
+cat <<EOF
+fe-pro is pairable for ${window} s.
+
+On the iPhone: Settings -> Bluetooth -> tap "fe-pro". The code will appear below.
+After pairing, allow notifications when iOS asks.
+
+Press Enter once paired (the phone may show "Not Connected" briefly, then reconnects over LE;
+if it's still not connected after a minute, toggle the phone's Bluetooth off and on).
+EOF
 read -r -t "$window" || true
