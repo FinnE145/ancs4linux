@@ -25,6 +25,7 @@ OBSERVER_STARTED = now_iso()
 # Every call to bluetoothd gets a limit; dasbus's default is to wait forever.
 CALL_TIMEOUT_MS = 10_000
 SUBSCRIBE_RETRY_SECONDS = 2
+STOP_START_PAUSE_MS = 1500
 SUBSCRIBE_MAX_ATTEMPTS = 60
 
 
@@ -193,6 +194,12 @@ class MobileDevice:
             # then iOS sends nothing: notifications that arrived or were cleared during
             # the gap would be missed. Switching it off and on forces the full list.
             (self.notification_source, "StopNotify"),
+            # bluetoothd replies to StopNotify at once and writes the "disable" to the phone
+            # afterwards. Re-enabling while that write is pending hits a use-after-free in
+            # BlueZ's gatt-client (fixed upstream after 5.87, "Fix calling destroy after
+            # unregistering notify"); the corrupted heap then crashed bluetoothd on the next
+            # disconnect. Give the write time to finish.
+            (None, "pause"),
             (self.notification_source, "StartNotify"),
         ]
 
@@ -221,6 +228,13 @@ class MobileDevice:
             self.finish_subscribe(generation)
             return
         proxy, method = steps[0]
+
+        if method == "pause":
+            GLib.timeout_add(
+                STOP_START_PAUSE_MS,
+                lambda: self.run_subscribe_steps(generation, attempt, steps[1:]) and False,
+            )
+            return
 
         def done(call: Callable[[], Any]) -> None:
             try:
