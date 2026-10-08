@@ -106,6 +106,13 @@ class ObserverAPI(ABC):
     def GetStatus(self) -> Str:
         pass
 
+    # JSON per paired device: the current notification list (ShowNotification JSON, as
+    # last reported; reset on each fresh subscription, kept across a disconnect) plus the
+    # id range (id_base changes only when the observer restarts). See MobileDevice.notifications().
+    @abstractmethod
+    def GetNotifications(self) -> Str:
+        pass
+
 
 class AdvertisingAPI(ABC):
     interface = "ancs4linux.Advertising"

@@ -51,6 +51,16 @@ class ObserverServer(ObserverAPI):
     def SubscribeFailed(self, device_handle: Str, error: Str) -> None:
         pass
 
+    def GetNotifications(self) -> Str:
+        devices = list(self.scanner.devices.values()) if self.scanner else []
+        return json.dumps(
+            {
+                "observer_started": OBSERVER_STARTED,
+                "now": now_iso(),
+                "devices": [d.notifications() for d in devices if d.paired],
+            }
+        )
+
     def GetStatus(self) -> Str:
         devices = list(self.scanner.devices.values()) if self.scanner else []
         return json.dumps(
