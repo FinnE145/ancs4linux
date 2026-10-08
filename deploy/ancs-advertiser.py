@@ -26,7 +26,7 @@ import re
 import socket
 import subprocess
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from dasbus.connection import SystemMessageBus
 from dasbus.loop import EventLoop
@@ -81,7 +81,9 @@ class Advertiser:
         self.bus = bus
         self.registered = False
         self.retry_pending = False
-        self.stale_suspects: Dict[str, int] = {}  # LE handle -> consecutive sightings
+        # LE handle -> (check round, time.monotonic()) of its first stale sighting.
+        self.stale_suspects: Dict[str, Tuple[int, float]] = {}
+        self.stale_round = 0
         self.adapter = bus.get_proxy("org.bluez", ADAPTER)
         self.properties = bus.get_proxy(
             "org.bluez", ADAPTER, interface_name="org.freedesktop.DBus.Properties"
@@ -133,7 +135,8 @@ class Advertiser:
         if new:
             log.info("bluetoothd (re)started; registering again")
             self.schedule_register()
-            GLib.timeout_add_seconds(RETRY_SECONDS, self.enforce_closed)
+            # One-shot (enforce_closed returns True for the periodic recheck).
+            GLib.timeout_add_seconds(RETRY_SECONDS, lambda: self.enforce_closed() and False)
 
     # --- adapter state -------------------------------------------------------------
     @staticmethod
@@ -206,6 +209,8 @@ class Advertiser:
 
     # --- stale links ----------------------------------------------------------------
     def check_stale_links(self) -> bool:
+        self.stale_round += 1
+        this_round = self.stale_round
         try:
             out = subprocess.run(
                 ["hcitool", "con"], capture_output=True, text=True, timeout=5
@@ -222,7 +227,7 @@ class Advertiser:
                 "org.bluez", device, interface_name="org.freedesktop.DBus.Properties"
             )
 
-            def done(call: Any, mac: str = mac, handle: str = handle) -> None:
+            def done(call: Any, mac: str = mac, handle: str = handle, rnd: int = this_round) -> None:
                 try:
                     state = call()
                 except Exception:
@@ -232,9 +237,13 @@ class Advertiser:
                 if not (paired and paired.unpack()) or connected is None or connected.unpack():
                     self.stale_suspects.pop(handle, None)
                     return
-                seen = self.stale_suspects.get(handle, 0) + 1
-                self.stale_suspects[handle] = seen
-                if seen >= 2:
+                # Act only on sightings from two different check rounds at least
+                # STALE_CHECK_SECONDS apart: late replies to two checks can arrive together.
+                first = self.stale_suspects.get(handle)
+                if first is None:
+                    self.stale_suspects[handle] = (rnd, time.monotonic())
+                    return
+                if rnd != first[0] and time.monotonic() - first[1] >= STALE_CHECK_SECONDS - 1:
                     log.warning(
                         f"stale LE link to {mac} (handle {handle}): kernel connected, "
                         "bluetoothd not; closing it so the phone reconnects cleanly"

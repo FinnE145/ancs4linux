@@ -1,0 +1,1091 @@
+From ff1c67f6f07fe9e24cac3e95591ab10f71a7d154 Mon Sep 17 00:00:00 2001
+From: FinnE145 <finne014@gmail.com>
+Date: Thu, 8 Oct 2026 17:40:53 +0000
+Subject: [PATCH] observer: no per-object proxies; reassemble Data Source;
+ GetNotifications()
+
+From a code review on 2026-10-08:
+
+- Critical: one dasbus proxy (and D-Bus match rule) per BlueZ object,
+  never released. With LE discovery (0008) bluetoothd lists dozens of
+  passing devices a minute, so within ~30 min the observer hit
+  dbus-daemon's 512-match-rule limit (10,163 rejections logged) and new
+  subscriptions to the phone silently received nothing: "subscribed",
+  zero notifications, for hours. Now bluez.py makes all calls directly on
+  the connection (async, time-limited; no synchronous introspection) and
+  uses a fixed set of bus-wide subscriptions dispatched by path. Tested on
+  a private bus: 600 temporary devices, match rules 5 -> 5.
+- Data Source responses split across several notifications are
+  reassembled (long Mail bodies were cut, message_size/date lost).
+- A failed GetAppAttributes no longer holds that app's notifications for
+  the rest of the connection (emitted with an empty app name).
+- Event facts kept per UID until removed, so repeated attribute
+  responses don't lose category/flags.
+- No Show after its Dismiss for notifications awaiting their app name.
+- The StopNotify -> StartNotify gap (0009) is enforced per device by
+  time, so overlapping subscribe attempts can't bypass it.
+- Discovery control re-evaluates after every call (no scanning left on
+  for a whole connection); removed devices are forgotten; a newly paired
+  device's properties are read once so it subscribes without a restart.
+- New GetNotifications(): per paired device the current list as
+  ShowNotification JSON plus id_base / id_min / id_max.
+
+---
+ ancs4linux/common/apis.py          |   7 +
+ ancs4linux/observer/bluez.py       | 126 +++++++++++++++
+ ancs4linux/observer/device.py      | 127 ++++++++++-----
+ ancs4linux/observer/device_comm.py | 230 ++++++++++++++++++---------
+ ancs4linux/observer/scanner.py     | 246 +++++++++++++++--------------
+ ancs4linux/observer/server.py      |  10 ++
+ 6 files changed, 523 insertions(+), 223 deletions(-)
+ create mode 100644 ancs4linux/observer/bluez.py
+
+diff --git a/ancs4linux/common/apis.py b/ancs4linux/common/apis.py
+index 5e7ff1e..adb7850 100644
+--- a/ancs4linux/common/apis.py
++++ b/ancs4linux/common/apis.py
+@@ -106,6 +106,13 @@ class ObserverAPI(ABC):
+     def GetStatus(self) -> Str:
+         pass
+ 
++    # JSON per paired device: the current notification list (ShowNotification JSON, as
++    # last reported; reset on each fresh subscription, kept across a disconnect) plus the
++    # id range (id_base changes only when the observer restarts). See MobileDevice.notifications().
++    @abstractmethod
++    def GetNotifications(self) -> Str:
++        pass
++
+ 
+ class AdvertisingAPI(ABC):
+     interface = "ancs4linux.Advertising"
+diff --git a/ancs4linux/observer/bluez.py b/ancs4linux/observer/bluez.py
+new file mode 100644
+index 0000000..2278532
+--- /dev/null
++++ b/ancs4linux/observer/bluez.py
+@@ -0,0 +1,126 @@
++"""Talking to bluetoothd without per-object proxies (added on fe-pro).
++
++Upstream created a dasbus proxy, and with it a D-Bus match rule, for every BlueZ object it
++saw and never released them. With LE discovery running, bluetoothd lists dozens of passing
++devices a minute, so the observer hit dbus-daemon's 512-match-rule limit within about half
++an hour; after that new subscriptions (the phone's ANCS characteristics) silently received
++nothing. Proxies also introspect synchronously, without a timeout, on first use.
++
++Instead:
++- a fixed handful of bus-wide signal subscriptions (InterfacesAdded/Removed, and
++  PropertiesChanged filtered by interface name), dispatched by object path;
++- method calls made directly on the connection, always asynchronous with a time limit
++  (synchronous ones only where a D-Bus caller is waiting for the answer, also limited).
++
++Values are passed on unpacked into plain Python types.
++"""
++import logging
++from typing import Any, Callable, Dict, List, Optional
++
++from gi.repository import Gio, GLib  # type: ignore # dynamic
++
++log = logging.getLogger(__name__)
++
++BLUEZ = "org.bluez"
++# Every call to bluetoothd gets a limit; the D-Bus libraries' default is to wait forever.
++CALL_TIMEOUT_MS = 10_000
++
++Done = Callable[[Any, Optional[str]], None]  # (result, error message or None)
++
++
++def connection() -> Gio.DBusConnection:
++    return Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
++
++
++def call(
++    path: str,
++    interface: str,
++    method: str,
++    params: Optional[GLib.Variant] = None,
++    done: Optional[Done] = None,
++    timeout_ms: int = CALL_TIMEOUT_MS,
++) -> None:
++    """Asynchronous call to bluetoothd; done(result, None) or done(None, error)."""
++
++    def finish(conn: Gio.DBusConnection, result: Gio.AsyncResult, _: Any) -> None:
++        try:
++            reply = conn.call_finish(result)
++        except GLib.Error as e:
++            if done:
++                done(None, e.message)
++            else:
++                log.warning(f"{interface}.{method} on {path} failed: {e.message}")
++            return
++        if done:
++            unpacked = reply.unpack() if reply is not None else ()
++            done(unpacked[0] if len(unpacked) == 1 else unpacked, None)
++
++    connection().call(
++        BLUEZ, path, interface, method, params, None,
++        Gio.DBusCallFlags.NONE, timeout_ms, None, finish, None,
++    )
++
++
++def call_sync(
++    path: str,
++    interface: str,
++    method: str,
++    params: Optional[GLib.Variant] = None,
++    timeout_ms: int = CALL_TIMEOUT_MS,
++) -> Any:
++    """Blocking call with a time limit; raises GLib.Error. Only where a caller waits."""
++    reply = connection().call_sync(
++        BLUEZ, path, interface, method, params, None,
++        Gio.DBusCallFlags.NONE, timeout_ms, None,
++    )
++    unpacked = reply.unpack() if reply is not None else ()
++    return unpacked[0] if len(unpacked) == 1 else unpacked
++
++
++def get_all(path: str, interface: str, done: Done) -> None:
++    call(path, "org.freedesktop.DBus.Properties", "GetAll", GLib.Variant("(s)", (interface,)), done)
++
++
++def on_properties_changed(
++    interface: str, handler: Callable[[str, Dict[str, Any], List[str]], None]
++) -> int:
++    """One bus-wide subscription for PropertiesChanged of `interface` on any BlueZ object."""
++
++    def dispatch(conn, sender, path, iface, member, params, _user):  # noqa: ANN001
++        changed_interface, changes, invalidated = params.unpack()
++        if changed_interface != interface:
++            return
++        try:
++            handler(path, changes, invalidated)
++        except Exception:
++            log.exception(f"handling PropertiesChanged({interface}) on {path} failed")
++
++    return connection().signal_subscribe(
++        BLUEZ, "org.freedesktop.DBus.Properties", "PropertiesChanged", None, interface,
++        Gio.DBusSignalFlags.NONE, dispatch, None,
++    )
++
++
++def on_object_manager(
++    added: Callable[[str, Dict[str, Dict[str, Any]]], None],
++    removed: Callable[[str, List[str]], None],
++) -> None:
++    def dispatch(conn, sender, path, iface, member, params, _user):  # noqa: ANN001
++        try:
++            if member == "InterfacesAdded":
++                added(*params.unpack())
++            else:
++                removed(*params.unpack())
++        except Exception:
++            log.exception(f"handling {member} failed")
++
++    for member in ("InterfacesAdded", "InterfacesRemoved"):
++        connection().signal_subscribe(
++            BLUEZ, "org.freedesktop.DBus.ObjectManager", member, "/", None,
++            Gio.DBusSignalFlags.NONE, dispatch, None,
++        )
++
++
++def managed_objects() -> Dict[str, Dict[str, Dict[str, Any]]]:
++    """At startup only; blocking but time-limited."""
++    return call_sync("/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects")
+diff --git a/ancs4linux/observer/device.py b/ancs4linux/observer/device.py
+index 1dd9e4f..cb029e1 100644
+--- a/ancs4linux/observer/device.py
++++ b/ancs4linux/observer/device.py
+@@ -1,5 +1,7 @@
++import json
+ import logging
+ import random
++import time
+ from collections import deque
+ from datetime import datetime, timezone
+ from typing import Any, Callable, Dict, List, Optional, Tuple
+@@ -8,8 +10,9 @@ from gi.repository import GLib  # type: ignore # dynamic
+ 
+ from ancs4linux.common.apis import ObserverAPI
+ from ancs4linux.common.dbus import InvalidAction, ObjPath
+-from ancs4linux.common.external_apis import BluezGattCharacteristicAPI
+-from ancs4linux.observer.device_comm import DeviceCommunicator
++from ancs4linux.common.apis import ShowNotificationData
++from ancs4linux.observer import bluez
++from ancs4linux.observer.device_comm import GATT_CHARACTERISTIC, DeviceCommunicator
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -22,10 +25,15 @@ def now_iso() -> str:
+ 
+ OBSERVER_STARTED = now_iso()
+ 
+-# Every call to bluetoothd gets a limit; dasbus's default is to wait forever.
+-CALL_TIMEOUT_MS = 10_000
++CALL_TIMEOUT_MS = bluez.CALL_TIMEOUT_MS
+ SUBSCRIBE_RETRY_SECONDS = 2
+-STOP_START_PAUSE_MS = 1500
++# Minimum gap between a StopNotify on the Notification Source and the next StartNotify,
++# whichever subscribe attempt sends them. bluetoothd replies to StopNotify at once and writes
++# the "disable" to the phone afterwards; re-enabling while that write is pending hits a
++# use-after-free in BlueZ's gatt-client (fixed upstream after 5.87, "Fix calling destroy
++# after unregistering notify"), and the corrupted heap crashed bluetoothd on the next
++# disconnect.
++STOP_START_GAP_SECONDS = 1.5
+ SUBSCRIBE_MAX_ATTEMPTS = 60
+ 
+ 
+@@ -64,25 +72,50 @@ class MobileDevice:
+         self.paired = False
+         self.connected = False
+         self.name: Optional[str] = None
+-        self.notification_source: Optional[BluezGattCharacteristicAPI] = None
+-        self.control_point: Optional[BluezGattCharacteristicAPI] = None
+-        self.data_source: Optional[BluezGattCharacteristicAPI] = None
++        # Object paths of the phone's ANCS characteristics (no proxies: see bluez.py).
++        self.notification_source: Optional[str] = None
++        self.control_point: Optional[str] = None
++        self.data_source: Optional[str] = None
++        self.last_stop_notify = 0.0  # time.monotonic() of the last NS StopNotify sent
++        # The current list as last reported (for GetNotifications): ShowNotification JSON
++        # by id, reset on each fresh subscription, kept across a disconnect.
++        self.current: Dict[int, Dict[str, Any]] = {}
++        self.current_updated: Optional[str] = None
+ 
+     def set_notification_source(self, path: ObjPath) -> None:
+         self.unsubscribe()
+-        self.notification_source = BluezGattCharacteristicAPI.connect(path)
++        self.notification_source = path
+         self.try_subscribe()
+ 
+     def set_control_point(self, path: ObjPath) -> None:
+         self.unsubscribe()
+-        self.control_point = BluezGattCharacteristicAPI.connect(path)
++        self.control_point = path
+         self.try_subscribe()
+ 
+     def set_data_source(self, path: ObjPath) -> None:
+         self.unsubscribe()
+-        self.data_source = BluezGattCharacteristicAPI.connect(path)
++        self.data_source = path
+         self.try_subscribe()
+ 
++    def char_removed(self, path: str) -> None:
++        if path in (self.notification_source, self.control_point, self.data_source):
++            self.unsubscribe()
++            if path == self.notification_source:
++                self.notification_source = None
++            if path == self.control_point:
++                self.control_point = None
++            if path == self.data_source:
++                self.data_source = None
++
++    def on_char_value(self, path: str, value: List[int]) -> None:
++        comm = self.communicator
++        if comm is None:
++            return
++        if path == self.notification_source:
++            comm.on_ns_value(value)
++        elif path == self.data_source:
++            comm.on_ds_value(value)
++
+     def set_paired(self, paired: bool) -> None:
+         self.unsubscribe()
+         self.paired = paired
+@@ -130,9 +163,32 @@ class MobileDevice:
+             self.seen_since_scan_started = True
+             self.note("seen", rssi=rssi)
+ 
+-    def note_shown(self) -> None:
++    def note_shown(self, data: ShowNotificationData) -> None:
+         self.shown_since_subscribed += 1
+         self.last_notification = now_iso()
++        self.current[data.id] = json.loads(data.json())
++        self.current_updated = self.last_notification
++
++    def note_dismissed(self, id: int) -> None:
++        if self.current.pop(id, None) is not None:
++            self.current_updated = now_iso()
++
++    def notifications(self) -> Dict[str, Any]:
++        ids = sorted(self.current)
++        return {
++            "device": self.path,
++            "name": self.name,
++            "connected": self.connected,
++            "subscribed": self.communicator is not None,
++            "subscribed_since": self.subscribed_since,
++            "updated": self.current_updated,
++            # ids are id_base + iOS UID; id_base changes only when the observer restarts
++            # (then every id changes, and a Subscribed + full list follows).
++            "id_base": self.id_base,
++            "id_min": ids[0] if ids else None,
++            "id_max": ids[-1] if ids else None,
++            "notifications": [self.current[i] for i in ids],
++        }
+ 
+     def status(self) -> Dict[str, Any]:
+         return {
+@@ -193,13 +249,8 @@ class MobileDevice:
+             # switched on. After a reconnect BlueZ can restore the old subscription, and
+             # then iOS sends nothing: notifications that arrived or were cleared during
+             # the gap would be missed. Switching it off and on forces the full list.
++            # (Any NS StartNotify waits STOP_START_GAP_SECONDS after the last StopNotify.)
+             (self.notification_source, "StopNotify"),
+-            # bluetoothd replies to StopNotify at once and writes the "disable" to the phone
+-            # afterwards. Re-enabling while that write is pending hits a use-after-free in
+-            # BlueZ's gatt-client (fixed upstream after 5.87, "Fix calling destroy after
+-            # unregistering notify"); the corrupted heap then crashed bluetoothd on the next
+-            # disconnect. Give the write time to finish.
+-            (None, "pause"),
+             (self.notification_source, "StartNotify"),
+         ]
+ 
+@@ -227,27 +278,29 @@ class MobileDevice:
+         if not steps:
+             self.finish_subscribe(generation)
+             return
+-        proxy, method = steps[0]
+-
+-        if method == "pause":
+-            GLib.timeout_add(
+-                STOP_START_PAUSE_MS,
+-                lambda: self.run_subscribe_steps(generation, attempt, steps[1:]) and False,
+-            )
++        path, method = steps[0]
++        if path is None:
++            self.subscribe_failed(generation, attempt, f"{method}: characteristic gone")
+             return
+ 
+-        def done(call: Callable[[], Any]) -> None:
+-            try:
+-                call()
+-            except Exception as e:
+-                self.subscribe_failed(generation, attempt, f"{method}: {e}")
++        if path == self.notification_source and method == "StartNotify":
++            wait = self.last_stop_notify + STOP_START_GAP_SECONDS - time.monotonic()
++            if wait > 0:
++                GLib.timeout_add(
++                    int(wait * 1000) + 1,
++                    lambda: self.run_subscribe_steps(generation, attempt, steps) and False,
++                )
++                return
++        if path == self.notification_source and method == "StopNotify":
++            self.last_stop_notify = time.monotonic()
++
++        def done(_: Any, error: Optional[str]) -> None:
++            if error is not None:
++                self.subscribe_failed(generation, attempt, f"{method}: {error}")
+                 return
+             self.run_subscribe_steps(generation, attempt, steps[1:])
+ 
+-        try:
+-            getattr(proxy, method)(callback=done, timeout=CALL_TIMEOUT_MS)
+-        except Exception as e:
+-            self.subscribe_failed(generation, attempt, f"{method}: {e}")
++        bluez.call(path, GATT_CHARACTERISTIC, method, None, done)
+ 
+     def subscribe_failed(self, generation: int, attempt: int, error: str) -> None:
+         if not self.subscribe_is_current(generation):
+@@ -265,10 +318,10 @@ class MobileDevice:
+         )
+ 
+     def finish_subscribe(self, generation: int) -> None:
+-        comm = DeviceCommunicator(self)
+-        comm.attach()
+-        self.communicator = comm
++        self.communicator = DeviceCommunicator(self)
+         self.actionable.clear()
++        self.current.clear()
++        self.current_updated = now_iso()
+         self.subscribed_since = now_iso()
+         self.shown_since_subscribed = 0
+         self.note("subscribed")
+diff --git a/ancs4linux/observer/device_comm.py b/ancs4linux/observer/device_comm.py
+index dfe207f..d7d4f14 100644
+--- a/ancs4linux/observer/device_comm.py
++++ b/ancs4linux/observer/device_comm.py
+@@ -1,8 +1,12 @@
+ import logging
++import struct
+ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
+ 
++from gi.repository import GLib  # type: ignore # dynamic
++
+ from ancs4linux.common.apis import ShowNotificationData
+-from ancs4linux.common.dbus import InvalidAction, Variant
++from ancs4linux.common.dbus import InvalidAction
++from ancs4linux.observer import bluez
+ from ancs4linux.observer.ancs.builders import (
+     GetAppAttributes,
+     GetNotificationAttributes,
+@@ -13,18 +17,20 @@ from ancs4linux.observer.ancs.constants import (
+     CategoryID,
+     CommandID,
+     EventID,
++    NotificationAttributeID,
+ )
+ from ancs4linux.observer.ancs.parsers import (
+     AppAttributes,
+-    DataSourceEvent,
+     Notification,
+     NotificationAttributes,
+ )
+ 
+ log = logging.getLogger(__name__)
+ 
+-# Same limit as device.py; dasbus's default is to wait forever.
+-CALL_TIMEOUT_MS = 10_000
++GATT_CHARACTERISTIC = "org.bluez.GattCharacteristic1"
++# A Data Source response can span several notifications; if the rest never comes (link
++# dropped, iOS gave up), give up on the partial one after this long.
++DATA_SOURCE_STALL_MS = 3000
+ 
+ CATEGORY_NAMES = {
+     value: name
+@@ -48,48 +54,46 @@ class DeviceCommunicator:
+         self.awaiting_app_names: Set[str] = set()
+         self.known_app_names: Dict[str, str] = dict()
+         # Control point writes waiting to be sent, one at a time (see write_control_point).
+-        self.write_queue: List[Tuple[List[int], str]] = []
++        self.write_queue: List[Tuple[List[int], str, Any]] = []
+         self.write_in_flight = False
+         self.detached = False
+-        # Notification Source events awaiting their attributes, by iOS notification UID.
+-        self.pending_events: Dict[int, Notification] = dict()
+-
+-    def attach(self) -> None:
+-        assert self.device.notification_source and self.device.data_source
+-        # Keep the proxies we attached to: the device may swap in new ones on reconnect,
+-        # and detach() must remove our handlers from these, not from the new ones.
+-        self.notification_source = self.device.notification_source
+-        self.data_source = self.device.data_source
+-        self.notification_source.PropertiesChanged.disconnect()
+-        self.notification_source.PropertiesChanged.connect(self.on_ns_change)
+-        self.data_source.PropertiesChanged.disconnect()
+-        self.data_source.PropertiesChanged.connect(self.on_ds_change)
++        # Latest Notification Source event per iOS UID, kept until iOS removes it, so a
++        # repeated attributes response still gets its event facts.
++        self.events: Dict[int, Notification] = dict()
++        # Data Source reassembly: responses can be split across several notifications.
++        self.ds_buffer = bytearray()
++        self.ds_stall_timer: Optional[int] = None
++        # Attribute counts of the notification-attributes requests sent, by UID: needed to
++        # know where a (possibly split) response ends.
++        self.expected_attributes: Dict[int, int] = dict()
+ 
+     def detach(self) -> None:
+         self.detached = True
+         self.write_queue.clear()
+-        self.notification_source.PropertiesChanged.disconnect(self.on_ns_change)
+-        self.data_source.PropertiesChanged.disconnect(self.on_ds_change)
+-
+-    def on_ns_change(
+-        self, interface: str, changes: Dict[str, Variant], invalidated: List[str]
+-    ) -> None:
+-        if interface != "org.bluez.GattCharacteristic1" or "Value" not in changes:
+-            return
++        if self.ds_stall_timer is not None:
++            GLib.source_remove(self.ds_stall_timer)
++            self.ds_stall_timer = None
+ 
+-        notification = Notification.parse(changes["Value"].unpack())
++    # --- Notification Source -------------------------------------------------------
++    def on_ns_value(self, value: List[int]) -> None:
++        notification = Notification.parse(value)
+         if notification.type in (
+             EventID.NotificationAdded,
+             EventID.NotificationModified,
+         ):
+             # Upstream turned pre-existing additions into dismissals; fetch them all and
+             # pass the flag on instead, so consumers decide what "old" means.
+-            self.pending_events[notification.id] = notification
++            self.events[notification.id] = notification
+             self.ask_for_notification_details(notification)
+         else:
+-            self.pending_events.pop(notification.id, None)
+-            self.device.actionable.pop(self.host_id(notification.id), None)
+-            self.device.server.emit_dismiss_notification(self.host_id(notification.id))
++            self.events.pop(notification.id, None)
++            host_id = self.host_id(notification.id)
++            self.device.actionable.pop(host_id, None)
++            # Don't emit a Show for it after this Dismiss (it may be waiting for its app's
++            # name).
++            self.notification_queue = [d for d in self.notification_queue if d.id != host_id]
++            self.device.note_dismissed(host_id)
++            self.device.server.emit_dismiss_notification(host_id)
+ 
+     def host_id(self, uid: int) -> int:
+         return (self.device.id_base + uid) % UINT_MAX
+@@ -113,55 +117,135 @@ class DeviceCommunicator:
+             get_positive_action=notification.has_positive_action(),
+             get_negative_action=notification.has_negative_action(),
+         )
+-        self.write_control_point(msg.to_list(), "notification attributes")
++        # AppIdentifier, Title, Subtitle, Message, MessageSize, Date + any action labels.
++        count = 6 + notification.has_positive_action() + notification.has_negative_action()
++        self.write_control_point(
++            msg.to_list(), "notification attributes", ("notification", notification.id, count)
++        )
+ 
+-    def write_control_point(self, value: List[int], what: str) -> None:
+-        # Asynchronous with a time limit (see device.py): a reply that never comes must not
+-        # freeze the observer. bluetoothd allows one outstanding write per characteristic
+-        # ("In Progress" otherwise), so writes are queued and sent one at a time -- a
++    # --- control point -------------------------------------------------------------
++    def write_control_point(self, value: List[int], what: str, request: Any) -> None:
++        # Asynchronous with a time limit: a reply that never comes must not freeze the
++        # observer. bluetoothd allows one outstanding write per characteristic ("In
++        # Progress" otherwise), so writes are queued and sent one at a time -- a
+         # reconnect's full list means dozens of them at once.
+-        self.write_queue.append((value, what))
++        self.write_queue.append((value, what, request))
+         if not self.write_in_flight:
+             self.send_next_write()
+ 
+     def send_next_write(self) -> None:
+-        if not self.write_queue or self.detached:
++        if not self.write_queue or self.detached or not self.device.control_point:
+             self.write_in_flight = False
+             return
+-        assert self.device.control_point
+-        value, what = self.write_queue.pop(0)
++        value, what, request = self.write_queue.pop(0)
+         self.write_in_flight = True
++        if request[0] == "notification":
++            self.expected_attributes[request[1]] = request[2]
+ 
+-        def done(call: Any) -> None:
+-            try:
+-                call()
+-            except Exception as e:
+-                log.warning(f"Control point write ({what}) failed: {e}")
++        def done(_: Any, error: Optional[str]) -> None:
++            if error is not None:
++                log.warning(f"Control point write ({what}) failed: {error}")
++                self.request_failed(request)
+             self.send_next_write()
+ 
+-        try:
+-            self.device.control_point.WriteValue(
+-                value, {}, callback=done, timeout=CALL_TIMEOUT_MS
+-            )
+-        except Exception as e:
+-            log.warning(f"Control point write ({what}) failed: {e}")
+-            self.send_next_write()
++        bluez.call(
++            self.device.control_point, GATT_CHARACTERISTIC, "WriteValue",
++            GLib.Variant("(aya{sv})", (bytes(value), {})), done,
++        )
+ 
+-    def on_ds_change(
+-        self, interface: str, changes: Dict[str, Variant], invalidated: List[str]
+-    ) -> None:
+-        if interface != "org.bluez.GattCharacteristic1" or "Value" not in changes:
+-            return
++    def request_failed(self, request: Any) -> None:
++        if request[0] == "notification":
++            self.expected_attributes.pop(request[1], None)
++        elif request[0] == "app":
++            # Don't hold that app's notifications back for the rest of the connection:
++            # pass them on with an empty app name (as iOS gave none).
++            app_id = request[1]
++            self.awaiting_app_names.discard(app_id)
++            self.known_app_names.setdefault(app_id, "")
++            self.process_queue()
++
++    # --- Data Source ---------------------------------------------------------------
++    def on_ds_value(self, value: List[int]) -> None:
++        self.ds_buffer += bytes(value)
++        while self.ds_buffer:
++            parsed = self.parse_data_source(self.ds_buffer)
++            if parsed is None:
++                break  # incomplete: wait for the rest
++            consumed, handler, item = parsed
++            del self.ds_buffer[:consumed]
++            if handler:
++                handler(item)
++        self.restart_stall_timer()
++
++    def restart_stall_timer(self) -> None:
++        if self.ds_stall_timer is not None:
++            GLib.source_remove(self.ds_stall_timer)
++            self.ds_stall_timer = None
++        if self.ds_buffer:
++            self.ds_stall_timer = GLib.timeout_add(DATA_SOURCE_STALL_MS, self.data_source_stalled)
+ 
+-        ev = DataSourceEvent.parse(changes["Value"].unpack())
+-        if ev.type == CommandID.GetNotificationAttributes:
+-            self.on_notification_attributes(ev.as_notification_attributes())
+-        elif ev.type == CommandID.GetAppAttributes:
+-            self.on_app_attributes(ev.as_app_attributes())
++    def data_source_stalled(self) -> bool:
++        self.ds_stall_timer = None
++        log.warning(f"Incomplete Data Source response dropped ({len(self.ds_buffer)} bytes)")
++        self.ds_buffer.clear()
++        return False
++
++    def parse_data_source(self, buf: bytearray) -> Optional[Tuple[int, Any, Any]]:
++        """(bytes consumed, handler, parsed item) for one complete response, else None."""
++        command = buf[0]
++        if command == CommandID.GetNotificationAttributes:
++            if len(buf) < 5:
++                return None
++            uid = struct.unpack("<I", bytes(buf[1:5]))[0]
++            count = self.expected_attributes.get(uid)
++            if count is None:
++                log.warning(f"Data Source response for unknown request (uid {uid}); dropped")
++                return len(buf), None, None
++            pos, attrs = 5, {}
++            for _ in range(count):
++                if len(buf) < pos + 3:
++                    return None
++                attr_id = buf[pos]
++                length = struct.unpack("<H", bytes(buf[pos + 1 : pos + 3]))[0]
++                if len(buf) < pos + 3 + length:
++                    return None
++                attrs[attr_id] = bytes(buf[pos + 3 : pos + 3 + length]).decode(
++                    "utf8", errors="replace"
++                )
++                pos += 3 + length
++            self.expected_attributes.pop(uid, None)
++            A = NotificationAttributeID
++            item = NotificationAttributes(
++                id=uid,
++                app_id=attrs.get(A.AppIdentifier, ""),
++                title=attrs.get(A.Title, ""),
++                subtitle=attrs.get(A.Subtitle, ""),
++                message=attrs.get(A.Message, ""),
++                date=attrs.get(A.Date, ""),
++                message_size=attrs.get(A.MessageSize, ""),
++                positive_action=attrs.get(A.PositiveActionLabel),
++                negative_action=attrs.get(A.NegativeActionLabel),
++            )
++            return pos, self.on_notification_attributes, item
++        if command == CommandID.GetAppAttributes:
++            end = buf.find(b"\0", 1)
++            if end < 0:
++                return None
++            app_id = bytes(buf[1:end]).decode("utf8", errors="replace")
++            pos = end + 1
++            # One attribute was requested (DisplayName): id, length, value.
++            if len(buf) < pos + 3:
++                return None
++            length = struct.unpack("<H", bytes(buf[pos + 1 : pos + 3]))[0]
++            if len(buf) < pos + 3 + length:
++                return None
++            name = bytes(buf[pos + 3 : pos + 3 + length]).decode("utf8", errors="replace")
++            return pos + 3 + length, self.on_app_attributes, AppAttributes(app_id=app_id, app_name=name)
++        log.warning(f"Unknown Data Source response (command {command}); dropped")
++        return len(buf), None, None
+ 
+     def on_notification_attributes(self, attrs: NotificationAttributes) -> None:
+-        assert self.device.name
+-        event = self.pending_events.pop(attrs.id, None)
++        event = self.events.get(attrs.id)
+         self.device.actionable[self.host_id(attrs.id)] = (
+             attrs.positive_action is not None,
+             attrs.negative_action is not None,
+@@ -169,7 +253,7 @@ class DeviceCommunicator:
+         self.queue_notification(
+             ShowNotificationData(
+                 device_handle=self.device.path,
+-                device_name=self.device.name,
++                device_name=self.device.name or "",
+                 app_id=attrs.app_id,
+                 app_name="",
+                 id=self.host_id(attrs.id),
+@@ -187,8 +271,7 @@ class DeviceCommunicator:
+ 
+     def on_app_attributes(self, attrs: AppAttributes) -> None:
+         self.known_app_names[attrs.app_id] = attrs.app_name
+-        if attrs.app_id in self.awaiting_app_names:
+-            self.awaiting_app_names.remove(attrs.app_id)
++        self.awaiting_app_names.discard(attrs.app_id)
+         self.process_queue()
+ 
+     def queue_notification(self, data: ShowNotificationData) -> None:
+@@ -197,10 +280,10 @@ class DeviceCommunicator:
+     def ask_for_app_name(self, app_id: str) -> None:
+         self.awaiting_app_names.add(app_id)
+         msg = GetAppAttributes(app_id=app_id)
+-        self.write_control_point(msg.to_list(), "app attributes")
++        self.write_control_point(msg.to_list(), "app attributes", ("app", app_id))
+ 
+     def emit_show(self, data: ShowNotificationData) -> None:
+-        self.device.note_shown()
++        self.device.note_shown(data)
+         self.device.server.emit_show_notification(data)
+ 
+     def process_queue(self) -> None:
+@@ -231,8 +314,13 @@ class DeviceCommunicator:
+                 f"Notification {notification_id} has no "
+                 f"{'positive' if is_positive else 'negative'} action"
+             )
++        if not self.device.control_point:
++            raise InvalidAction("Phone is not connected/subscribed")
+         id = (notification_id - self.device.id_base) % UINT_MAX
+         msg = PerformNotificationAction(notification_id=id, is_positive=is_positive)
+-        assert self.device.control_point
+         # Synchronous so the caller hears about iOS rejecting it, but never unbounded.
+-        self.device.control_point.WriteValue(msg.to_list(), {}, timeout=CALL_TIMEOUT_MS)
++        # (May fail with "In Progress" while a list is being fetched: retry.)
++        bluez.call_sync(
++            self.device.control_point, GATT_CHARACTERISTIC, "WriteValue",
++            GLib.Variant("(aya{sv})", (bytes(msg.to_list()), {})),
++        )
+diff --git a/ancs4linux/observer/scanner.py b/ancs4linux/observer/scanner.py
+index 7bce3ec..cdbcb48 100644
+--- a/ancs4linux/observer/scanner.py
++++ b/ancs4linux/observer/scanner.py
+@@ -1,35 +1,41 @@
+ import logging
+-from functools import partial
+ from typing import Any, Dict, List, Optional
+ 
+ from gi.repository import GLib  # type: ignore # dynamic
+ 
+ from ancs4linux.common.apis import ObserverAPI
+-from ancs4linux.common.dbus import ObjPath, Str, SystemBus, Variant
+-from ancs4linux.common.external_apis import (
+-    BluezDeviceAPI,
+-    BluezGattCharacteristicAPI,
+-    BluezRootAPI,
+-)
++from ancs4linux.observer import bluez
+ from ancs4linux.observer.ancs.constants import (
+     ANCS_CHARS,
+     CONTROL_POINT_CHAR,
+     DATA_SOURCE_CHAR,
+     NOTIFICATION_SOURCE_CHAR,
+ )
+-from ancs4linux.observer.device import CALL_TIMEOUT_MS, MobileDevice, now_iso
++from ancs4linux.observer.device import MobileDevice, now_iso
++from ancs4linux.observer.device_comm import GATT_CHARACTERISTIC
+ 
+ log = logging.getLogger(__name__)
+ 
++DEVICE = "org.bluez.Device1"
++ADAPTER = "org.bluez.Adapter1"
+ SCAN_RECHECK_SECONDS = 60
+ 
+ 
++def device_of(char_path: str) -> str:
++    # /org/bluez/hci0/dev_XX/serviceNNNN/charNNNN -> /org/bluez/hci0/dev_XX
++    return "/".join(char_path.split("/")[:-2])
++
++
+ class Scanner:
++    """Tracks paired phones and their ANCS characteristics from bluetoothd's objects.
++
++    Uses a fixed set of bus-wide subscriptions (see bluez.py) rather than a proxy per
++    object: with discovery running, bluetoothd lists dozens of passing devices a minute.
++    """
++
+     def __init__(self, server: ObserverAPI):
+         self.server = server
+-        self.root = BluezRootAPI.connect()
+         self.devices: Dict[str, MobileDevice] = {}
+-        self.property_observers: Dict[str, BluezDeviceAPI] = {}
+         # LE discovery while a paired phone is disconnected (added on fe-pro): hearing the
+         # phone's own advertisements tells consumers it's nearby even though it isn't
+         # connecting. Stopped while connected, so it never competes with the link.
+@@ -38,97 +44,106 @@ class Scanner:
+         self.scan_call_pending = False
+         self.adapter_path: Optional[str] = None
+ 
+-    def start_observing(self):
+-        self.root.InterfacesAdded.connect(self.process_object)
+-        self.root.InterfacesRemoved.connect(self.remove_observers)
+-        for path, services in self.root.GetManagedObjects().items():
+-            if "org.bluez.Adapter1" in services and self.adapter_path is None:
+-                self.adapter_path = path
+-            self.process_object(path, services)
++    def start_observing(self) -> None:
++        bluez.on_object_manager(self.process_object, self.remove_object)
++        bluez.on_properties_changed(DEVICE, self.device_changed)
++        bluez.on_properties_changed(GATT_CHARACTERISTIC, self.char_changed)
++        objects = bluez.managed_objects()
++        # Devices first: a characteristic is only taken for a device already known.
++        for path, interfaces in sorted(objects.items(), key=lambda o: DEVICE not in o[1]):
++            self.process_object(path, interfaces)
+         self.update_scanning()
+         GLib.timeout_add_seconds(SCAN_RECHECK_SECONDS, self.recheck_scanning)
+ 
+-    def process_object(
+-        self, path: ObjPath, services: Dict[Str, Dict[Str, Variant]]
+-    ) -> None:
+-        if BluezDeviceAPI.interface in services:
+-            if path not in self.property_observers:
+-                self.property_observers[path] = BluezDeviceAPI.connect(path)
+-                self.property_observers[path].PropertiesChanged.connect(
+-                    partial(self.process_property, path)
+-                )
+-                self.process_property(
+-                    path,
+-                    BluezDeviceAPI.interface,
+-                    services[BluezDeviceAPI.interface],
+-                    [],
+-                )
+-
+-        if BluezGattCharacteristicAPI.interface in services:
+-            uuid = services[BluezGattCharacteristicAPI.interface]["UUID"].unpack()
+-            if uuid in ANCS_CHARS:
+-                device = "/".join(path.split("/")[:-2])
+-                self.devices.setdefault(device, MobileDevice(device, self.server))
++    # --- objects -------------------------------------------------------------------
++    def process_object(self, path: str, interfaces: Dict[str, Dict[str, Any]]) -> None:
++        if ADAPTER in interfaces and self.adapter_path is None:
++            self.adapter_path = path
++        if DEVICE in interfaces:
++            self.device_changed(path, interfaces[DEVICE], [])
++        if GATT_CHARACTERISTIC in interfaces:
++            uuid = interfaces[GATT_CHARACTERISTIC].get("UUID")
++            device = self.devices.get(device_of(path))
++            if uuid in ANCS_CHARS and device is not None:
+                 if uuid == NOTIFICATION_SOURCE_CHAR:
+-                    self.devices[device].set_notification_source(path)
++                    device.set_notification_source(path)
+                 elif uuid == CONTROL_POINT_CHAR:
+-                    self.devices[device].set_control_point(path)
++                    device.set_control_point(path)
+                 elif uuid == DATA_SOURCE_CHAR:
+-                    self.devices[device].set_data_source(path)
+-
+-    def process_property(
+-        self,
+-        device: ObjPath,
+-        interface: str,
+-        changes: Dict[str, Variant],
+-        invalidated: List[str],
+-    ) -> None:
+-        if interface == BluezDeviceAPI.interface:
+-            # Only paired devices can be ANCS phones. Discovery makes bluetoothd list every
+-            # advertiser nearby (other people's phones, TVs, ...); ignore those.
+-            if device not in self.devices:
+-                if not ("Paired" in changes and changes["Paired"].unpack()):
+-                    return
+-                self.devices[device] = MobileDevice(device, self.server)
+-            if "Paired" in changes:
+-                self.devices[device].set_paired(changes["Paired"].unpack())
+-            if "Connected" in changes:
+-                self.devices[device].set_connected(changes["Connected"].unpack())
+-            if "Alias" in changes:
+-                self.devices[device].set_name(changes["Alias"].unpack())
+-            if "RSSI" in changes:
+-                rssi = changes["RSSI"].unpack()
+-                if rssi != 0:  # 0 = bluetoothd invalidating it when discovery stops
+-                    self.devices[device].note_seen(rssi)
+-            if "Paired" in changes or "Connected" in changes:
++                    device.set_data_source(path)
++
++    def remove_object(self, path: str, interfaces: List[str]) -> None:
++        # Only forget the device when Device1 itself goes away. Other interfaces on the
++        # device path (e.g. Battery1) disappear on every disconnect.
++        if DEVICE in interfaces and path in self.devices:
++            device = self.devices.pop(path)
++            device.unsubscribe()
++            log.info(f"{path} removed from bluetoothd")
++            self.update_scanning()
++        elif GATT_CHARACTERISTIC in interfaces:
++            device = self.devices.get(device_of(path))
++            if device is not None:
++                device.char_removed(path)
++
++    def device_changed(self, path: str, changes: Dict[str, Any], _: List[str]) -> None:
++        # Only paired devices can be ANCS phones. Discovery makes bluetoothd list every
++        # advertiser nearby (other people's phones, TVs, ...); ignore those.
++        device = self.devices.get(path)
++        if device is None:
++            if not changes.get("Paired"):
++                return
++            device = self.devices[path] = MobileDevice(path, self.server)
++            # Newly paired (or first seen): changes may not include its name/connection
++            # state, so read everything once.
++            bluez.get_all(path, DEVICE, lambda props, err: self.got_all(path, props, err))
++        if "Paired" in changes:
++            device.set_paired(changes["Paired"])
++        if "Connected" in changes:
++            device.set_connected(changes["Connected"])
++        if "Alias" in changes:
++            device.set_name(changes["Alias"])
++        if "RSSI" in changes and changes["RSSI"] != 0:
++            # 0 = bluetoothd invalidating it when discovery stops
++            device.note_seen(changes["RSSI"])
++        if "Paired" in changes or "Connected" in changes:
++            self.update_scanning()
++
++    def got_all(self, path: str, props: Any, error: Optional[str]) -> None:
++        if error is not None:
++            log.warning(f"Reading {path} failed: {error}")
++            return
++        if path in self.devices:
++            # Only what's missing, so a fresher change isn't overwritten by older state.
++            device = self.devices[path]
++            if device.name is None and "Alias" in props:
++                device.set_name(props["Alias"])
++            if not device.connection_observed and "Connected" in props:
++                device.set_connected(props["Connected"])
+                 self.update_scanning()
++
++    def char_changed(self, path: str, changes: Dict[str, Any], _: List[str]) -> None:
++        if "Value" not in changes:
+             return
++        device = self.devices.get(device_of(path))
++        if device is not None:
++            device.on_char_value(path, changes["Value"])
+ 
+-    # --- discovery ----------------------------------------------------------------
++    # --- discovery -----------------------------------------------------------------
+     def want_scanning(self) -> bool:
+         return any(d.paired and not d.connected for d in self.devices.values())
+ 
+-    def adapter_call(self, interface: str, method: str, *args: Any, done=None) -> None:
+-        proxy = SystemBus().get_proxy(
+-            "org.bluez", self.adapter_path, interface_name=interface
+-        )
+-
+-        def finish(call: Any) -> None:
++    def adapter_call(self, interface: str, method: str, params: Any = None, done=None) -> None:
++        def finish(result: Any, error: Optional[str]) -> None:
+             self.scan_call_pending = False
+-            try:
+-                result = call()
+-            except Exception as e:
+-                log.warning(f"{method} failed: {e}")
+-                return
+-            if done:
++            if error is not None:
++                log.warning(f"{method} failed: {error}")
++            elif done:
+                 done(result)
++            # Things may have changed while the call was in flight.
++            self.update_scanning()
+ 
+         self.scan_call_pending = True
+-        try:
+-            getattr(proxy, method)(*args, callback=finish, timeout=CALL_TIMEOUT_MS)
+-        except Exception as e:
+-            self.scan_call_pending = False
+-            log.warning(f"{method} failed: {e}")
++        bluez.call(self.adapter_path, interface, method, params, finish)
+ 
+     def update_scanning(self) -> None:
+         if self.adapter_path is None or self.scan_call_pending:
+@@ -136,30 +151,44 @@ class Scanner:
+         want = self.want_scanning()
+         if want and not self.scanning:
+             self.adapter_call(
+-                "org.bluez.Adapter1",
++                ADAPTER,
+                 "SetDiscoveryFilter",
+-                {
+-                    "Transport": Variant("s", "le"),
+-                    # Report every advertisement, so last_seen stays current. (A filter
+-                    # also stops bluetoothd from hiding RSSI changes smaller than 8 dB.)
+-                    "DuplicateData": Variant("b", True),
+-                },
+-                done=lambda _: self.adapter_call(
+-                    "org.bluez.Adapter1", "StartDiscovery", done=self.scan_started
++                GLib.Variant(
++                    "(a{sv})",
++                    (
++                        {
++                            "Transport": GLib.Variant("s", "le"),
++                            # Report every advertisement, so last_seen stays current. (A
++                            # filter also stops bluetoothd from hiding RSSI changes < 8 dB.)
++                            "DuplicateData": GLib.Variant("b", True),
++                        },
++                    ),
+                 ),
++                done=lambda _: self.start_discovery(),
+             )
+         elif not want and self.scanning:
+-            self.adapter_call("org.bluez.Adapter1", "StopDiscovery", done=self.scan_stopped)
++            self.adapter_call(ADAPTER, "StopDiscovery", done=self.scan_stopped)
+ 
+-    def scan_started(self, _: Any) -> None:
++    def start_discovery(self) -> None:
++        # Called from SetDiscoveryFilter's finish(), before it clears scan_call_pending.
++        def started(_: Any, error: Optional[str]) -> None:
++            self.scan_call_pending = False
++            if error is not None:
++                log.warning(f"StartDiscovery failed: {error}")
++            else:
++                self.scan_started()
++            self.update_scanning()
++
++        self.scan_call_pending = True
++        bluez.call(self.adapter_path, ADAPTER, "StartDiscovery", None, started)
++
++    def scan_started(self) -> None:
+         self.scanning = True
+         self.scanning_since = now_iso()
+         log.info("Scanning for paired phones (none connected)")
+         for d in self.devices.values():
+             if d.paired and not d.connected:
+                 d.note_scan_started()
+-        # The phone may have connected while StartDiscovery was in flight.
+-        self.update_scanning()
+ 
+     def scan_stopped(self, _: Any) -> None:
+         self.scanning = False
+@@ -167,32 +196,19 @@ class Scanner:
+         log.info("Stopped scanning (paired phone connected)")
+         for d in self.devices.values():
+             d.note("scan_stopped")
+-        self.update_scanning()
+ 
+     def recheck_scanning(self) -> bool:
+         # bluetoothd ends a client's discovery if it restarts; notice and start again.
+-        if self.scanning and self.adapter_path:
++        if self.scanning and self.adapter_path and not self.scan_call_pending:
+             def check(discovering: Any) -> None:
+-                value = discovering.unpack() if hasattr(discovering, "unpack") else discovering
+-                if not value:
++                if not discovering:
+                     log.warning("Discovery stopped behind our back; starting again")
+                     self.scanning = False
+-                    self.update_scanning()
+ 
+             self.adapter_call(
+-                "org.freedesktop.DBus.Properties", "Get", "org.bluez.Adapter1",
+-                "Discovering", done=check,
++                "org.freedesktop.DBus.Properties", "Get",
++                GLib.Variant("(ss)", (ADAPTER, "Discovering")), done=check,
+             )
+         else:
+             self.update_scanning()
+         return True
+-
+-    def remove_observers(self, path: ObjPath, services: List[Str]) -> None:
+-        # Only forget the device when Device1 itself goes away. Other interfaces on the
+-        # device path (e.g. Battery1) disappear on every disconnect, and dropping the
+-        # watcher then means a reconnect is never noticed.
+-        if BluezDeviceAPI.interface not in services:
+-            return
+-        if path in self.property_observers:
+-            self.property_observers[path].PropertiesChanged.disconnect()
+-            del self.property_observers[path]
+diff --git a/ancs4linux/observer/server.py b/ancs4linux/observer/server.py
+index 4154ca6..c5f8cac 100644
+--- a/ancs4linux/observer/server.py
++++ b/ancs4linux/observer/server.py
+@@ -51,6 +51,16 @@ class ObserverServer(ObserverAPI):
+     def SubscribeFailed(self, device_handle: Str, error: Str) -> None:
+         pass
+ 
++    def GetNotifications(self) -> Str:
++        devices = list(self.scanner.devices.values()) if self.scanner else []
++        return json.dumps(
++            {
++                "observer_started": OBSERVER_STARTED,
++                "now": now_iso(),
++                "devices": [d.notifications() for d in devices if d.paired],
++            }
++        )
++
+     def GetStatus(self) -> Str:
+         devices = list(self.scanner.devices.values()) if self.scanner else []
+         return json.dumps(
+-- 
+2.43.0
+

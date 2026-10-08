@@ -4,8 +4,8 @@ set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 
 # Mirror output to a log next to this script, readable by finne.
+touch install.log && chown finne:finne install.log
 exec > >(tee install.log) 2>&1
-chown finne:finne install.log
 
 COMMIT=b658546f08d1468f6d79aa900cc7faa9d938837d   # upstream HEAD, 2026-08-29
 PREFIX=/opt/ancs4linux
