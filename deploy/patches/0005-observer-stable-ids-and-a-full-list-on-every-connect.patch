@@ -1,4 +1,4 @@
-From da1b274ee7626f6be1d99b96c4b7a8fb92502087 Mon Sep 17 00:00:00 2001
+From e4ed4ab12d67c6b8ed0938191ab757b866cef4b4 Mon Sep 17 00:00:00 2001
 From: FinnE145 <finne014@gmail.com>
 Date: Fri, 2 Oct 2026 02:01:52 +0000
 Subject: [PATCH] observer: stable ids and a full list on every connection
@@ -17,7 +17,6 @@ after every reconnect.
   follows is the phone's complete current list.
 - Keep the action guard per device, reset on each fresh subscription and
   rebuilt from the list, instead of per connection.
-
 ---
  ancs4linux/common/apis.py          |  8 ++++++++
  ancs4linux/observer/device.py      | 19 ++++++++++++++++++-

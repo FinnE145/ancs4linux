@@ -1,4 +1,4 @@
-# fe-pro version of upstream autorun/ancs4linux-advertising.service: venv path, restart policy.
+# Local version of upstream autorun/ancs4linux-advertising.service: venv path, restart policy.
 [Unit]
 Description=ancs4linux Advertising daemon (BLE advertisement + pairing agent)
 Requires=bluetooth.service

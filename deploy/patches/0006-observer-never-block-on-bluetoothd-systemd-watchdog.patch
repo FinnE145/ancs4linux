@@ -1,4 +1,4 @@
-From e249a02f7df94ff83dfc692e08c386e900502a84 Mon Sep 17 00:00:00 2001
+From 1201795c1d355e1a7c80eef8f176cfbc23d36ab1 Mon Sep 17 00:00:00 2001
 From: FinnE145 <finne014@gmail.com>
 Date: Tue, 6 Oct 2026 16:30:19 +0000
 Subject: [PATCH] observer: never block on bluetoothd; systemd watchdog
@@ -20,7 +20,6 @@ reconnecting at all.
 - Actions stay synchronous (so callers see iOS errors) but are limited.
 - main() pings systemd's watchdog from the main loop when WATCHDOG_USEC
   is set, so a blocked loop gets the observer restarted.
-
 ---
  ancs4linux/observer/device.py      | 106 ++++++++++++++++++++---------
  ancs4linux/observer/device_comm.py |  54 +++++++++++++--

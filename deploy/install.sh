@@ -1,10 +1,17 @@
 #!/bin/bash
-# Installs ancs4linux on fe-pro. Run with sudo. Safe to re-run.
+# Installs ancs4linux with the patches in patches/. Run with sudo. Safe to re-run.
+# See README.md; settings in ancs4linux.env (copied to /etc/ancs4linux.env on first install).
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 
-# Mirror output to a log next to this script, readable by finne.
-touch install.log && chown finne:finne install.log
+# Settings: the installed env file wins over the default one next to this script.
+ENV_FILE=/etc/ancs4linux.env; [ -e "$ENV_FILE" ] || ENV_FILE=ancs4linux.env
+ANCS_USER=$(. "$ENV_FILE"; echo "${ANCS_USER:-}")
+ANCS_USER=${ANCS_USER:-${SUDO_USER:-}}
+[ -n "$ANCS_USER" ] && id "$ANCS_USER" >/dev/null 2>&1 || { echo "Set ANCS_USER in $ENV_FILE (or run via sudo from that user)."; exit 1; }
+
+# Mirror output to a log next to this script, readable by ANCS_USER.
+touch install.log && chown "$ANCS_USER:" install.log
 exec > >(tee install.log) 2>&1
 
 COMMIT=b658546f08d1468f6d79aa900cc7faa9d938837d   # upstream HEAD, 2026-08-29
@@ -14,16 +21,16 @@ apt-get install -y python3-venv
 
 # The advertiser needs bluetoothd >= 5.87 (see ancs4linux-advertise.service).
 bluez=$(dpkg-query -W -f='${Version}' bluez)
-dpkg --compare-versions "$bluez" ge 5.87 || { echo "bluez $bluez is too old; install 5.87 first (SERVER.md)"; exit 1; }
+dpkg --compare-versions "$bluez" ge 5.87 || { echo "bluez $bluez is too old; install 5.87 first (README.md)"; exit 1; }
 
 groupadd -f ancs4linux
-usermod -aG ancs4linux finne
+usermod -aG ancs4linux "$ANCS_USER"
 
 install -d "$PREFIX" "$PREFIX/bin" "$PREFIX/deploy"
 [ -d "$PREFIX/src/.git" ] || git clone https://github.com/pzmarzly/ancs4linux "$PREFIX/src"
 git -C "$PREFIX/src" fetch --quiet origin
 git -C "$PREFIX/src" checkout --quiet --force "$COMMIT"
-# Local fixes on top of upstream (BLE/ANCS-level only; see SERVER.md).
+# Local fixes on top of upstream (BLE/ANCS-level only; see README.md).
 for p in patches/*.patch; do git -C "$PREFIX/src" apply "$PWD/$p"; done
 
 # System site packages give us apt's python3-gi, so PyGObject needn't be compiled.
@@ -41,7 +48,8 @@ ln -sf "$PREFIX/venv/bin/ancs4linux-ctl" /usr/local/bin/ancs4linux-ctl
 install -m 644 "$PREFIX/src/autorun/ancs4linux-observer.xml" /etc/dbus-1/system.d/ancs4linux-observer.conf
 install -m 644 "$PREFIX/src/autorun/ancs4linux-advertising.xml" /etc/dbus-1/system.d/ancs4linux-advertising.conf
 for unit in observer advertising advertise logger; do
-    install -m 644 "ancs4linux-$unit.service" /etc/systemd/system/
+    sed "s/@ANCS_USER@/$ANCS_USER/g" "ancs4linux-$unit.service" > "/etc/systemd/system/ancs4linux-$unit.service"
+    chmod 644 "/etc/systemd/system/ancs4linux-$unit.service"
 done
 [ -e /etc/ancs4linux.env ] || install -m 644 ancs4linux.env /etc/ancs4linux.env
 

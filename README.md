@@ -1,5 +1,10 @@
 # ANCS4Linux
 
+> **This fork** (branch `fe-pro`) fixes the observer for long-running use with BlueZ 5.87: reliable
+> reconnects with a full list each time, stable ids, all ANCS fields passed on, no blocking
+> D-Bus calls, connection status for consumers. It adds a system-service setup in
+> [`deploy/`](deploy/README.md). The original README follows.
+
 > iOS & iPadOS notification service client for GNU/Linux
 
 This project lets you receive iOS and iPadOS notifications on your Linux desktop/laptop. No jailbreak needed.

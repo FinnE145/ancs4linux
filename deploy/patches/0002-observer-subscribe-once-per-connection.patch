@@ -1,4 +1,4 @@
-From 51a6af6fc8de500797d7b60a9889782737ce6d1e Mon Sep 17 00:00:00 2001
+From f01f75725871b3b5ecd5a68a66f84a3659120425 Mon Sep 17 00:00:00 2001
 From: FinnE145 <finne014@gmail.com>
 Date: Fri, 2 Oct 2026 01:22:58 +0000
 Subject: [PATCH] observer: subscribe once per connection
@@ -9,7 +9,6 @@ attempt, and each successful one attached handlers, so every
 notification was emitted once per attempt (4x observed). Only the
 newest attempt now attaches, and replacing a communicator detaches the
 old one's handlers.
-
 ---
  ancs4linux/observer/device.py      | 16 +++++++++++++---
  ancs4linux/observer/device_comm.py | 16 ++++++++++++----

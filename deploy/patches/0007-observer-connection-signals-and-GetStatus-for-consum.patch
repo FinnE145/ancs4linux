@@ -1,4 +1,4 @@
-From 3f6ba0b23f0ec262a6b9dc500f0907c7cbcb0b49 Mon Sep 17 00:00:00 2001
+From d945845d7078bc7fbd668965c5441cb7f2257697 Mon Sep 17 00:00:00 2001
 From: FinnE145 <finne014@gmail.com>
 Date: Tue, 6 Oct 2026 17:33:20 +0000
 Subject: [PATCH] observer: connection signals and GetStatus() for consumers
@@ -10,7 +10,6 @@ subscribed and since when, notifications shown since then, last
 notification time, subscribe failures on this connection and the last
 error, plus the last 50 connect/disconnect/subscribe events. Facts only
 (UTC timestamps, null when unknown); what they mean is up to consumers.
-
 ---
  ancs4linux/common/apis.py          | 23 ++++++++++
  ancs4linux/observer/device.py      | 69 ++++++++++++++++++++++++++++++

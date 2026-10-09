@@ -1,4 +1,4 @@
-From fdebb718e69b90604dd55958fb7eeee91371954e Mon Sep 17 00:00:00 2001
+From 802eff6a0eb6b228464ba95238e5e71f7afaff7d Mon Sep 17 00:00:00 2001
 From: FinnE145 <finne014@gmail.com>
 Date: Fri, 2 Oct 2026 01:46:20 +0000
 Subject: [PATCH] observer: refuse actions on ids not valid for this connection
@@ -9,7 +9,6 @@ the wrong call). InvokeDeviceAction now refuses ids not issued on the
 current connection, ids already removed, and actions iOS didn't offer,
 and reports unknown devices / no connection instead of ignoring them
 silently. Errors are ancs4linux.Error.InvalidAction.
-
 ---
  ancs4linux/common/dbus.py          |  5 +++++
  ancs4linux/observer/device.py      |  7 ++++---

@@ -1,4 +1,4 @@
-"""Keep fe-pro reachable for the bonded iPhone over LE, and keep pairing closed.
+"""Keep this machine reachable for the bonded iPhone over LE, and keep pairing closed.
 
 Run by ancs4linux-advertise.service (as root) with the ancs4linux venv's Python.
 

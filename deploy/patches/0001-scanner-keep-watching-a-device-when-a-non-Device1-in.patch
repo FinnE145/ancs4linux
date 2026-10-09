@@ -1,4 +1,4 @@
-From 47f5e4404ba9c5d2bc8c84753cf97b7d038eff56 Mon Sep 17 00:00:00 2001
+From 23dda4f85aece926a024c536bd3523e962bffb61 Mon Sep 17 00:00:00 2001
 From: FinnE145 <finne014@gmail.com>
 Date: Fri, 2 Oct 2026 01:12:45 +0000
 Subject: [PATCH] scanner: keep watching a device when a non-Device1 interface
@@ -7,7 +7,6 @@ Subject: [PATCH] scanner: keep watching a device when a non-Device1 interface
 iPhones expose Battery1 on the device path; it is removed on every
 disconnect, which made remove_observers() drop the Device1 watcher, so
 reconnects were never noticed and notifications never resumed.
-
 ---
  ancs4linux/observer/scanner.py | 5 +++++
  1 file changed, 5 insertions(+)

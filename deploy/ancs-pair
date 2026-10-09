@@ -1,13 +1,17 @@
 #!/bin/bash
-# Open a pairing window on fe-pro for the iPhone, and close it again afterwards.
+# Open a pairing window for the iPhone, and close it again afterwards.
 # Usage: sudo ancs-pair [seconds]   (default 180)
 # While open, ancs4linux's agent accepts any pairing request, so keep the window short.
-# Pairing happens over classic Bluetooth (that's how iOS Settings finds fe-pro); afterwards
+# Pairing happens over classic Bluetooth (that's how iOS Settings finds this machine); afterwards
 # classic is switched off again and the phone reconnects over LE by itself.
 set -u
 window=${1:-180}
 [ "$EUID" -eq 0 ] || { echo "Run with sudo." >&2; exit 1; }
-adapter() { busctl set-property org.bluez /org/bluez/hci0 org.bluez.Adapter1 "$1" b "$2"; }
+ADAPTER_PATH=$( [ -r /etc/ancs4linux.env ] && . /etc/ancs4linux.env; echo "${ADAPTER_PATH:-/org/bluez/hci0}")
+adapter() { busctl set-property org.bluez "$ADAPTER_PATH" org.bluez.Adapter1 "$1" b "$2"; }
+# The name the phone shows for this machine.
+name=$(busctl get-property org.bluez "$ADAPTER_PATH" org.bluez.Adapter1 Alias 2>/dev/null | cut -d'"' -f2)
+name=${name:-$(hostname)}
 
 monitor_pid=
 close() {
@@ -32,7 +36,7 @@ if [ ${#bonded[@]} -gt 0 ]; then
     echo "Already paired with:"
     for d in "${bonded[@]}"; do echo "    $d"; done
     echo
-    echo "To pair one of these again, stop here (Ctrl-C), forget fe-pro on the phone, and run:"
+    echo "To pair one of these again, stop here (Ctrl-C), forget $name on the phone, and run:"
     for d in "${bonded[@]}"; do
         echo
         echo "    bluetoothctl remove ${d%% *}"
@@ -63,9 +67,9 @@ bluetoothctl pairable on >/dev/null
 bluetoothctl discoverable on >/dev/null
 
 cat <<EOF
-fe-pro is pairable for ${window} s.
+$name is pairable for ${window} s.
 
-On the iPhone: Settings -> Bluetooth -> tap "fe-pro". The code will appear below.
+On the iPhone: Settings -> Bluetooth -> tap "$name". The code will appear below.
 After pairing, allow notifications when iOS asks.
 
 Press Enter once paired (the phone may show "Not Connected" briefly, then reconnects over LE;

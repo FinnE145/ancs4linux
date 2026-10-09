@@ -1,4 +1,4 @@
-From f3f9af1aaa0eb8a71c6288508b386853f5c116bf Mon Sep 17 00:00:00 2001
+From ac442bf6693b6f05a62533b7c91e0016ee457380 Mon Sep 17 00:00:00 2001
 From: FinnE145 <finne014@gmail.com>
 Date: Fri, 2 Oct 2026 01:38:34 +0000
 Subject: [PATCH] observer: pass on all ANCS notification data, unfiltered
@@ -20,7 +20,6 @@ category_count, subtitle, date and message_size exactly as sent (None
 where unknown; defaults keep older JSON parseable), dismissals use the
 matching id, attributes are parsed by ID, and a missing app name is
 passed on empty.
-
 ---
  ancs4linux/common/apis.py            | 22 +++++++++++
  ancs4linux/observer/ancs/builders.py |  6 ++-

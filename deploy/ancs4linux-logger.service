@@ -5,8 +5,9 @@ After=ancs4linux-observer.service ancs4linux-advertising.service
 
 [Service]
 Type=simple
-User=finne
-Group=finne
+# User and Group are filled in by install.sh (ANCS_USER in ancs4linux.env).
+User=@ANCS_USER@
+Group=@ANCS_USER@
 SupplementaryGroups=ancs4linux
 EnvironmentFile=/etc/ancs4linux.env
 ExecStart=/opt/ancs4linux/venv/bin/python3 /opt/ancs4linux/bin/ancs-logger.py

@@ -1,4 +1,4 @@
-From ff1c67f6f07fe9e24cac3e95591ab10f71a7d154 Mon Sep 17 00:00:00 2001
+From dc0b4238a4cfa6e1b648b2d6fb1c8c741bc89aca Mon Sep 17 00:00:00 2001
 From: FinnE145 <finne014@gmail.com>
 Date: Thu, 8 Oct 2026 17:40:53 +0000
 Subject: [PATCH] observer: no per-object proxies; reassemble Data Source;
@@ -29,7 +29,6 @@ From a code review on 2026-10-08:
   device's properties are read once so it subscribes without a restart.
 - New GetNotifications(): per paired device the current list as
   ShowNotification JSON plus id_base / id_min / id_max.
-
 ---
  ancs4linux/common/apis.py          |   7 +
  ancs4linux/observer/bluez.py       | 126 +++++++++++++++

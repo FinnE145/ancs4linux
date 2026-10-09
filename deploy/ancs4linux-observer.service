@@ -1,4 +1,4 @@
-# fe-pro version of upstream autorun/ancs4linux-observer.service: venv path, restart policy.
+# Local version of upstream autorun/ancs4linux-observer.service: venv path, restart policy.
 [Unit]
 Description=ancs4linux Observer daemon (reads iPhone notifications over ANCS)
 Requires=bluetooth.service

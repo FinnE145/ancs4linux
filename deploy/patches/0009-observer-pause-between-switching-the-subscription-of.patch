@@ -1,4 +1,4 @@
-From a6113bf9dc764dd3a7deb53ab61072a82d474cb2 Mon Sep 17 00:00:00 2001
+From 75de66458889bf5d00efb8f7550c1b7d80af821c Mon Sep 17 00:00:00 2001
 From: FinnE145 <finne014@gmail.com>
 Date: Thu, 8 Oct 2026 14:38:06 +0000
 Subject: [PATCH] observer: pause between switching the subscription off and on
@@ -15,7 +15,6 @@ malloc_consolidate. It also garbled the phone's stored name.
 
 Wait 1.5 s after StopNotify so the write completes first. (fe-pro's
 BlueZ build also carries the upstream fix.)
-
 ---
  ancs4linux/observer/device.py | 14 ++++++++++++++
  1 file changed, 14 insertions(+)

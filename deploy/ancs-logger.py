@@ -1,4 +1,4 @@
-"""Debug consumer for ancs4linux on fe-pro.
+"""Debug consumer for ancs4linux.
 
 Writes ancs4linux's D-Bus signals, plus BlueZ connection changes, as JSON lines to
 /var/log/ancs4linux/notifications.log. It only listens, so it can be restarted or
