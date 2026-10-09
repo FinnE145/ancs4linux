@@ -30,6 +30,9 @@ install -d "$PREFIX" "$PREFIX/bin" "$PREFIX/deploy"
 [ -d "$PREFIX/src/.git" ] || git clone https://github.com/pzmarzly/ancs4linux "$PREFIX/src"
 git -C "$PREFIX/src" fetch --quiet origin
 git -C "$PREFIX/src" checkout --quiet --force "$COMMIT"
+# Files added by an earlier run's patches are untracked, and checkout leaves them behind
+# (then `git apply` refuses to create them again).
+git -C "$PREFIX/src" clean -fdq
 # Local fixes on top of upstream (BLE/ANCS-level only; see README.md).
 for p in patches/*.patch; do git -C "$PREFIX/src" apply "$PWD/$p"; done
 
