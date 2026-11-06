@@ -17,6 +17,28 @@ LogsDirectoryMode=0750
 UMask=0027
 Restart=always
 RestartSec=5
+# Hardening (fe-pro phase 2), as on the three daemons: it only listens on D-Bus and appends to its LogsDirectory,
+# which stays writable under ProtectSystem=strict. No IP, no capabilities.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
 
 [Install]
 WantedBy=multi-user.target
