@@ -5,15 +5,16 @@ After=ancs4linux-observer.service ancs4linux-advertising.service
 
 [Service]
 Type=simple
-# User and Group are filled in by install.sh (ANCS_USER in ancs4linux.env).
-User=@ANCS_USER@
-Group=@ANCS_USER@
+# User and Group are filled in by install.sh (ANCS_DAEMON_USER in /etc/ancs4linux.env; on fe-pro ancsd).
+User=@ANCS_DAEMON_USER@
+Group=@ANCS_DAEMON_USER@
 SupplementaryGroups=ancs4linux
 EnvironmentFile=/etc/ancs4linux.env
 ExecStart=/opt/ancs4linux/venv/bin/python3 /opt/ancs4linux/bin/ancs-logger.py
 LogsDirectory=ancs4linux
-LogsDirectoryMode=0700
-UMask=0077
+# Group-readable, so the members of the daemon account's group (on fe-pro, finne) can read the log.
+LogsDirectoryMode=0750
+UMask=0027
 Restart=always
 RestartSec=5
 

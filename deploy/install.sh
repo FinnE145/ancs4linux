@@ -9,6 +9,10 @@ ENV_FILE=/etc/ancs4linux.env; [ -e "$ENV_FILE" ] || ENV_FILE=ancs4linux.env
 ANCS_USER=$(. "$ENV_FILE"; echo "${ANCS_USER:-}")
 ANCS_USER=${ANCS_USER:-${SUDO_USER:-}}
 [ -n "$ANCS_USER" ] && id "$ANCS_USER" >/dev/null 2>&1 || { echo "Set ANCS_USER in $ENV_FILE (or run via sudo from that user)."; exit 1; }
+# The account the services run as (not root). Made beforehand; on fe-pro by /srv/fe-pro/review/p2-7-ancsd.sh.
+ANCS_DAEMON_USER=$(. "$ENV_FILE"; echo "${ANCS_DAEMON_USER:-}")
+[ -n "$ANCS_DAEMON_USER" ] && [ "$ANCS_DAEMON_USER" != root ] && id "$ANCS_DAEMON_USER" >/dev/null 2>&1 || {
+    echo "Set ANCS_DAEMON_USER in $ENV_FILE to an existing account other than root."; exit 1; }
 
 # Mirror output to a log next to this script, readable by ANCS_USER.
 touch install.log && chown "$ANCS_USER:" install.log
@@ -25,6 +29,7 @@ dpkg --compare-versions "$bluez" ge 5.87 || { echo "bluez $bluez is too old; ins
 
 groupadd -f ancs4linux
 usermod -aG ancs4linux "$ANCS_USER"
+usermod -aG ancs4linux "$ANCS_DAEMON_USER"
 
 install -d "$PREFIX" "$PREFIX/bin" "$PREFIX/deploy"
 [ -d "$PREFIX/src/.git" ] || git clone https://github.com/pzmarzly/ancs4linux "$PREFIX/src"
@@ -48,10 +53,16 @@ install -m 644 ancs-advertiser.py "$PREFIX/bin/ancs-advertiser.py"
 ln -sf "$PREFIX/bin/ancs-pair" /usr/local/bin/ancs-pair
 ln -sf "$PREFIX/venv/bin/ancs4linux-ctl" /usr/local/bin/ancs4linux-ctl
 
-install -m 644 "$PREFIX/src/autorun/ancs4linux-observer.xml" /etc/dbus-1/system.d/ancs4linux-observer.conf
-install -m 644 "$PREFIX/src/autorun/ancs4linux-advertising.xml" /etc/dbus-1/system.d/ancs4linux-advertising.conf
+# Upstream's policies let only root own the two names; the services' account gets the same rights as root there.
+for name in Observer Advertising; do
+    lower=${name,,}
+    sed "s|</busconfig>|  <policy user=\"$ANCS_DAEMON_USER\">\n    <allow own=\"ancs4linux.$name\"/>\n    <allow send_destination=\"ancs4linux.$name\"/>\n    <allow receive_sender=\"ancs4linux.$name\"/>\n  </policy>\n</busconfig>|" \
+        "$PREFIX/src/autorun/ancs4linux-$lower.xml" > "/etc/dbus-1/system.d/ancs4linux-$lower.conf"
+    chmod 644 "/etc/dbus-1/system.d/ancs4linux-$lower.conf"
+done
 for unit in observer advertising advertise logger; do
-    sed "s/@ANCS_USER@/$ANCS_USER/g" "ancs4linux-$unit.service" > "/etc/systemd/system/ancs4linux-$unit.service"
+    sed -e "s/@ANCS_USER@/$ANCS_USER/g" -e "s/@ANCS_DAEMON_USER@/$ANCS_DAEMON_USER/g" \
+        "ancs4linux-$unit.service" > "/etc/systemd/system/ancs4linux-$unit.service"
     chmod 644 "/etc/systemd/system/ancs4linux-$unit.service"
 done
 [ -e /etc/ancs4linux.env ] || install -m 644 ancs4linux.env /etc/ancs4linux.env

@@ -5,6 +5,11 @@ Requires=bluetooth.service
 After=bluetooth.service
 
 [Service]
+# The account they run as is filled in by install.sh (ANCS_DAEMON_USER in /etc/ancs4linux.env; on fe-pro ancsd,
+# SERVER.md "Accounts"). ancs4linux is the group the D-Bus policy lets talk to the services.
+User=@ANCS_DAEMON_USER@
+Group=@ANCS_DAEMON_USER@
+SupplementaryGroups=ancs4linux
 Type=dbus
 BusName=ancs4linux.Observer
 ExecStart=/opt/ancs4linux/venv/bin/ancs4linux-observer
@@ -14,6 +19,26 @@ RestartSec=5
 # blocks again, systemd restarts it instead of it hanging silently.
 WatchdogSec=60
 NotifyAccess=main
+# Hardening (fe-pro phase 2): nothing here writes to disk, talks IP, or needs a capability.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
 
 [Install]
 WantedBy=multi-user.target

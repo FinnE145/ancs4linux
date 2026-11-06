@@ -11,6 +11,11 @@ BindsTo=ancs4linux-advertising.service
 After=ancs4linux-advertising.service bluetooth.service
 
 [Service]
+# The account they run as is filled in by install.sh (ANCS_DAEMON_USER in /etc/ancs4linux.env; on fe-pro ancsd,
+# SERVER.md "Accounts"). ancs4linux is the group the D-Bus policy lets talk to the services.
+User=@ANCS_DAEMON_USER@
+Group=@ANCS_DAEMON_USER@
+SupplementaryGroups=ancs4linux
 Type=simple
 ExecStartPre=/opt/ancs4linux/venv/bin/ancs4linux-ctl enable-pairing
 ExecStart=/opt/ancs4linux/venv/bin/python3 /opt/ancs4linux/bin/ancs-advertiser.py
@@ -20,6 +25,28 @@ WatchdogSec=60
 NotifyAccess=main
 # ADAPTER_PATH, if set.
 EnvironmentFile=-/etc/ancs4linux.env
+# Hardening (fe-pro phase 2): nothing here writes to disk, talks IP, or needs a capability beyond the raw HCI socket below; /run/ancs4linux-pairing is only read.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX AF_BLUETOOTH
+# `hcitool ledc` (dropping a stale LE link) opens a raw HCI socket.
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
 
 [Install]
 WantedBy=ancs4linux-advertising.service
