@@ -21,6 +21,13 @@ ADAPTER = "org.bluez.Adapter1"
 SCAN_RECHECK_SECONDS = 60
 
 
+def bluez_error(message: str) -> Optional[str]:
+    # "GDBus.Error:org.bluez.Error.InProgress: Operation ..." -> "org.bluez.Error.InProgress"
+    if message.startswith("GDBus.Error:"):
+        return message[len("GDBus.Error:"):].split(":", 1)[0]
+    return None
+
+
 def device_of(char_path: str) -> str:
     # /org/bluez/hci0/dev_XX/serviceNNNN/charNNNN -> /org/bluez/hci0/dev_XX
     return "/".join(char_path.split("/")[:-2])
@@ -132,11 +139,17 @@ class Scanner:
     def want_scanning(self) -> bool:
         return any(d.paired and not d.connected for d in self.devices.values())
 
-    def adapter_call(self, interface: str, method: str, params: Any = None, done=None) -> None:
+    def adapter_call(
+        self, interface: str, method: str, params: Any = None, done=None, failed=None
+    ) -> None:
         def finish(result: Any, error: Optional[str]) -> None:
             self.scan_call_pending = False
             if error is not None:
-                log.warning(f"{method} failed: {error}")
+                if failed is None or not failed(error):
+                    # No retry from here: an error that comes back at once would come back
+                    # at once again. recheck_scanning tries again in SCAN_RECHECK_SECONDS.
+                    log.warning(f"{method} failed: {error}")
+                    return
             elif done:
                 done(result)
             # Things may have changed while the call was in flight.
@@ -167,16 +180,25 @@ class Scanner:
                 done=lambda _: self.start_discovery(),
             )
         elif not want and self.scanning:
-            self.adapter_call(ADAPTER, "StopDiscovery", done=self.scan_stopped)
+            self.adapter_call(
+                ADAPTER, "StopDiscovery", done=self.scan_stopped, failed=self.stop_failed
+            )
 
     def start_discovery(self) -> None:
         # Called from SetDiscoveryFilter's finish(), before it clears scan_call_pending.
         def started(_: Any, error: Optional[str]) -> None:
             self.scan_call_pending = False
-            if error is not None:
+            if error is not None and bluez_error(error) != "org.bluez.Error.InProgress":
+                # Not retried here (see adapter_call); recheck_scanning tries again.
                 log.warning(f"StartDiscovery failed: {error}")
-            else:
-                self.scan_started()
+                return
+            if error is not None:
+                # bluetoothd says InProgress when this client already has a discovery
+                # session, running or still starting (adapter.c, start_discovery). That is
+                # what we asked for, e.g. after a StartDiscovery that timed out here but
+                # went through. Retrying at once looped: 11 million warnings in 12 hours.
+                log.info("StartDiscovery: already discovering for us")
+            self.scan_started()
             self.update_scanning()
 
         self.scan_call_pending = True
@@ -190,6 +212,15 @@ class Scanner:
             if d.paired and not d.connected:
                 d.note_scan_started()
 
+    def stop_failed(self, error: str) -> bool:
+        # "No discovery started": bluetoothd has no discovery session for this client (it
+        # restarted, or the adapter was reset), so we're already stopped.
+        if bluez_error(error) == "org.bluez.Error.Failed" and "No discovery started" in error:
+            log.info("StopDiscovery: no discovery of ours to stop")
+            self.scan_stopped(None)
+            return True
+        return False
+
     def scan_stopped(self, _: Any) -> None:
         self.scanning = False
         self.scanning_since = None
@@ -199,7 +230,11 @@ class Scanner:
 
     def recheck_scanning(self) -> bool:
         # bluetoothd ends a client's discovery if it restarts; notice and start again.
-        if self.scanning and self.adapter_path and not self.scan_call_pending:
+        # Also the only retry after a failed SetDiscoveryFilter/StartDiscovery/StopDiscovery.
+        if (
+            self.scanning and self.want_scanning()
+            and self.adapter_path and not self.scan_call_pending
+        ):
             def check(discovering: Any) -> None:
                 if not discovering:
                     log.warning("Discovery stopped behind our back; starting again")
