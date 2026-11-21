@@ -37,8 +37,11 @@ class FakeSystem:
     def observer_status(self):
         return self.status if self.observer_running else None
 
-    def adapter(self, prop):
-        return {"Discovering": self.observer_running, "ActiveInstances": 1}[prop]
+    def adapter(self, prop, interface="org.bluez.Adapter1"):
+        return {
+            ("org.bluez.Adapter1", "Discovering"): self.observer_running,
+            (rc.ADVERTISING, "ActiveInstances"): 1,
+        }[(interface, prop)]
 
     def paired_connected(self):
         if self.connect_when == "stopped" and not self.observer_running:

@@ -45,6 +45,9 @@ STATE_FILE = "/run/ancs4linux-reconnect/state.json"
 ADAPTER = os.environ.get("ADAPTER_PATH", "/org/bluez/hci0")
 HCI = ADAPTER.rsplit("/", 1)[-1]
 CALL_TIMEOUT_MS = 10_000
+# ActiveInstances is on the advertising manager, not Adapter1 (asking Adapter1 gave InvalidArgs
+# at the first install, 2026-11-21).
+ADVERTISING = "org.bluez.LEAdvertisingManager1"
 
 
 # --- the decision (pure) ------------------------------------------------------------------------
@@ -114,11 +117,11 @@ class System:
             print(f"observer GetStatus failed: {e}")
             return None
 
-    def adapter(self, prop: str) -> Any:
+    def adapter(self, prop: str, interface: str = "org.bluez.Adapter1") -> Any:
         try:
             (value,) = self._call(
                 "org.bluez", ADAPTER, "org.freedesktop.DBus.Properties", "Get",
-                self.GLib.Variant("(ss)", ("org.bluez.Adapter1", prop)),
+                self.GLib.Variant("(ss)", (interface, prop)),
             )
             return value
         except Exception as e:
@@ -165,7 +168,7 @@ def snapshot(system: Any, label: str) -> None:
     rate = "?" if before is None or after is None else str(after - before)
     print(
         f"{label}: Discovering={system.adapter('Discovering')} "
-        f"ActiveInstances={system.adapter('ActiveInstances')} hci_events_10s={rate} "
+        f"ActiveInstances={system.adapter('ActiveInstances', ADVERTISING)} hci_events_10s={rate} "
         f"links={system.links()}"
     )
 
