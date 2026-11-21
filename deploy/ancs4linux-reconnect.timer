@@ -1,0 +1,9 @@
+[Unit]
+Description=Check every 10 minutes that the iPhone is connected (ancs4linux)
+
+[Timer]
+OnBootSec=10min
+OnUnitInactiveSec=10min
+
+[Install]
+WantedBy=timers.target

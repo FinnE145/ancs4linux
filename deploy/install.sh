@@ -50,6 +50,7 @@ for p in patches/*.patch; do git -C "$PREFIX/src" apply "$PWD/$p"; done
 install -m 755 ancs-pair "$PREFIX/bin/ancs-pair"
 install -m 644 ancs-logger.py "$PREFIX/bin/ancs-logger.py"
 install -m 644 ancs-advertiser.py "$PREFIX/bin/ancs-advertiser.py"
+install -m 644 ancs-reconnect.py "$PREFIX/bin/ancs-reconnect.py"
 ln -sf "$PREFIX/bin/ancs-pair" /usr/local/bin/ancs-pair
 ln -sf "$PREFIX/venv/bin/ancs4linux-ctl" /usr/local/bin/ancs4linux-ctl
 
@@ -65,6 +66,8 @@ for unit in observer advertising advertise logger; do
         "ancs4linux-$unit.service" > "/etc/systemd/system/ancs4linux-$unit.service"
     chmod 644 "/etc/systemd/system/ancs4linux-$unit.service"
 done
+# The reconnect watchdog runs as root (ancs-reconnect.py's docstring), so it has nothing to fill in.
+install -m 644 -t /etc/systemd/system ancs4linux-reconnect.service ancs4linux-reconnect.timer
 [ -e /etc/ancs4linux.env ] || install -m 644 ancs4linux.env /etc/ancs4linux.env
 
 # Migration from the BlueZ 5.72 setup: the btmgmt advertisement and the 30 s check timer are
@@ -78,7 +81,7 @@ fi
 # Keep a copy of these deploy files next to the install, for reference/re-runs.
 if [ "$PWD" != "$PREFIX/deploy" ]; then
     rm -f "$PREFIX"/deploy/ancs-advert-check "$PREFIX"/deploy/*.timer "$PREFIX"/deploy/ancs4linux-advert-check.service
-    install -m 644 -t "$PREFIX/deploy" ancs4linux.env ancs-logger.py ancs-advertiser.py ancs-pair ./*.service install.sh
+    install -m 644 -t "$PREFIX/deploy" ancs4linux.env ancs-logger.py ancs-advertiser.py ancs-reconnect.py ancs-pair ./*.service ./*.timer install.sh
     install -d "$PREFIX/deploy/patches"
     install -m 644 -t "$PREFIX/deploy/patches" patches/*.patch
 fi
@@ -88,5 +91,7 @@ systemctl daemon-reload
 systemctl enable ancs4linux-observer ancs4linux-advertising ancs4linux-advertise ancs4linux-logger
 systemctl restart ancs4linux-observer ancs4linux-advertising ancs4linux-logger
 systemctl restart ancs4linux-advertise
+# Its first check comes 10 minutes after this, then every 10 minutes.
+systemctl enable --now ancs4linux-reconnect.timer
 
-systemctl --no-pager --lines=0 status ancs4linux-observer ancs4linux-advertising ancs4linux-advertise ancs4linux-logger
+systemctl --no-pager --lines=0 status ancs4linux-observer ancs4linux-advertising ancs4linux-advertise ancs4linux-logger ancs4linux-reconnect.timer

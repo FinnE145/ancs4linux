@@ -13,6 +13,7 @@ here shows notifications itself.
 | `ancs4linux-observer.service` | the observer (upstream daemon + patches), with a systemd watchdog |
 | `ancs4linux-advertising.service` | upstream's advertising daemon, used here only as the pairing agent |
 | `ancs4linux-advertise.service`, `ancs-advertiser.py` | keeps an ANCS-soliciting LE advertisement registered so the bonded phone reconnects on its own, keeps pairing closed outside `ancs-pair`, and repairs stale LE links (see the docstring) |
+| `ancs4linux-reconnect.timer`, `.service`, `ancs-reconnect.py` | every 10 minutes: if no phone has been connected and subscribed for 6 hours, stops the observer's scan and then, if that isn't enough, restarts bluetoothd; every 6 hours, 6 times at most, then waits (see the docstring). `journalctl -u ancs4linux-reconnect \| grep RESULT` says which stage worked. Tests: `python3 -m pytest deploy/tests` |
 | `ancs-pair` | opens a pairing window (`sudo ancs-pair [seconds]`, default 180) and prints the pairing code |
 | `ancs4linux-logger.service`, `ancs-logger.py` | debug consumer: writes the observer's signals as JSON lines to `/var/log/ancs4linux/` (bodies only with `LOG_BODIES=1`) |
 | `ancs4linux.env` | settings, installed to `/etc/ancs4linux.env` on first install |

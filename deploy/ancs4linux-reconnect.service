@@ -1,0 +1,35 @@
+# Brings the bonded iPhone back when it has stopped reconnecting: ancs-reconnect.py (see its
+# docstring). Started by ancs4linux-reconnect.timer. Root, because it stops the observer and
+# restarts bluetooth.service; its RESULT lines say which stage brought the phone back.
+[Unit]
+Description=Bring the iPhone back if it has stopped reconnecting (ancs4linux)
+After=bluetooth.service ancs4linux-observer.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/ancs4linux/bin/ancs-reconnect.py
+EnvironmentFile=-/etc/ancs4linux.env
+# An attempt is two waits of 120 s plus a few 10 s snapshots.
+TimeoutStartSec=15min
+# When the phone went and the attempts so far; a reboot starts the count again.
+RuntimeDirectory=ancs4linux-reconnect
+RuntimeDirectoryPreserve=yes
+# It keeps root's capabilities: systemd checks them before it lets a caller stop or restart a unit.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+IPAddressDeny=any
+# hciconfig and hcitool read the controller over an HCI socket.
+RestrictAddressFamilies=AF_UNIX AF_BLUETOOTH
